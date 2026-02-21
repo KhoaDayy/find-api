@@ -1,0 +1,13 @@
+node_modules/
+__pycache__/
+*.pem
+*.log
+api_log.txt
+session.txt
+build/
+.vscode/
+.DS_Store
+*.bin
+lookup_out*.json
+temp_*
+git_log.txt
