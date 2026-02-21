@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Where Winds Meet Core API Endpoints</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    colors: {
+                        "primary": "#13c8ec",
+                        "background-light": "#f6f8f8",
+                        "background-dark": "#101f22",
+                    },
+                    fontFamily: {
+                        "display": ["Space Grotesk", "sans-serif"]
+                    },
+                    borderRadius: { "DEFAULT": "0.5rem", "lg": "1rem", "xl": "1.5rem", "full": "9999px" },
+                },
+            },
+        }
+    </script>
+<style type="text/tailwindcss">
+        .glass-card {
+            background: rgba(40, 54, 57, 0.4);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .code-block {
+            background: rgba(13, 22, 24, 0.8);
+            font-family: 'Courier New', Courier, monospace;
+        }
+        ::-webkit-scrollbar {
+            width: 4px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #13c8ec;
+            border-radius: 10px;
+        }
+        body {
+            min-height: max(884px, 100dvh);
+        }
+    </style>
+<style>
+    body {
+      min-height: max(884px, 100dvh);
+    }
+  </style>
+  </head>
+<body class="bg-background-light dark:bg-background-dark font-display text-slate-900 dark:text-slate-100 min-h-screen flex flex-col">
+<header class="sticky top-0 z-50 glass-card border-b border-primary/10 px-4 py-4 flex items-center justify-between">
+<div class="flex items-center gap-3">
+<div class="bg-primary/20 p-2 rounded-lg">
+<span class="material-symbols-outlined text-primary">hub</span>
+</div>
+<div>
+<h1 class="text-sm font-bold tracking-tight text-primary uppercase">Where Winds Meet</h1>
+<p class="text-xs text-slate-400">Core API Endpoints</p>
+</div>
+</div>
+<div class="flex items-center gap-2 bg-black/20 px-3 py-1 rounded-full border border-white/5">
+<span class="relative flex h-2 w-2">
+<span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+<span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+</span>
+<span class="text-[10px] font-medium uppercase tracking-wider text-emerald-400">Live</span>
+</div>
+</header>
+<main class="flex-1 overflow-y-auto p-4 space-y-6 pb-24">
+<div class="relative">
+<span class="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-xl">search</span>
+<input class="w-full bg-primary/5 border border-white/10 rounded-xl py-3 pl-10 pr-4 text-sm focus:ring-1 focus:ring-primary focus:border-primary outline-none transition-all placeholder:text-slate-500" placeholder="Search core endpoints..." type="text"/>
+</div>
+<div class="flex items-center justify-between">
+<h2 class="text-lg font-bold flex items-center gap-2">
+<span class="w-1 h-5 bg-primary rounded-full"></span>
+                Essential Services
+            </h2>
+<span class="text-[10px] text-slate-500 font-mono">2 ENDPOINTS</span>
+</div>
+<section class="glass-card rounded-xl overflow-hidden border border-white/5">
+<div class="p-4 border-b border-white/5 flex items-center justify-between bg-white/5">
+<div class="flex items-center gap-3">
+<span class="bg-emerald-500/20 text-emerald-400 text-[10px] font-bold px-2 py-0.5 rounded border border-emerald-500/30">GET</span>
+<code class="text-primary text-sm font-semibold">/club_search</code>
+</div>
+<span class="material-symbols-outlined text-slate-500">unfold_less</span>
+</div>
+<div class="p-4">
+<p class="text-xs text-slate-400 mb-4">Query global guilds, martial arts clubs, and player associations across all game regions.</p>
+<div class="grid grid-cols-2 gap-3 mb-4">
+<div class="space-y-1">
+<label class="text-[10px] text-slate-500 uppercase font-bold">Club Name</label>
+<input class="w-full bg-black/30 border border-white/10 rounded-lg py-2 px-3 text-xs text-primary focus:ring-1 focus:ring-primary focus:border-primary outline-none" placeholder="Enter name..." type="text"/>
+</div>
+<div class="space-y-1">
+<label class="text-[10px] text-slate-500 uppercase font-bold">Server</label>
+<select class="w-full bg-black/30 border border-white/10 rounded-lg py-2 px-3 text-xs text-slate-300 focus:ring-1 focus:ring-primary focus:border-primary outline-none">
+<option>Mainland-1</option>
+<option>Global-E1</option>
+<option>Legacy-S1</option>
+</select>
+</div>
+</div>
+<button class="w-full bg-primary text-background-dark py-2.5 rounded-lg text-xs font-bold hover:bg-primary/90 transition-colors flex items-center justify-center gap-2">
+<span class="material-symbols-outlined text-lg">play_arrow</span>
+                    EXECUTE SEARCH
+                </button>
+</div>
+</section>
+<section class="glass-card rounded-xl overflow-hidden border border-white/5">
+<div class="p-4 border-b border-white/5 flex items-center justify-between bg-white/5">
+<div class="flex items-center gap-3">
+<span class="bg-emerald-500/20 text-emerald-400 text-[10px] font-bold px-2 py-0.5 rounded border border-emerald-500/30">GET</span>
+<code class="text-primary text-sm font-semibold">/convert</code>
+</div>
+<span class="material-symbols-outlined text-slate-500">settings_backup_restore</span>
+</div>
+<div class="p-4 flex items-center justify-between">
+<div>
+<p class="text-xs text-slate-300 font-medium">Legacy Face Plan Migration</p>
+<p class="text-[10px] text-slate-500">Transform legacy data to latest v2.0 character schema.</p>
+</div>
+<button class="bg-white/5 p-2 rounded-lg hover:bg-white/10 text-slate-300">
+<span class="material-symbols-outlined">chevron_right</span>
+</button>
+</div>
+</section>
+</main>
+<nav class="fixed bottom-0 left-0 right-0 glass-card border-t border-white/10 pt-2 pb-6 px-6 flex justify-between items-center z-50">
+<a class="flex flex-col items-center gap-1 group" href="#">
+<span class="material-symbols-outlined text-slate-500 group-hover:text-primary transition-colors">explore</span>
+<span class="text-[10px] font-medium text-slate-500 group-hover:text-primary">Explorer</span>
+</a>
+<a class="flex flex-col items-center gap-1 group" href="#">
+<div class="relative">
+<span class="material-symbols-outlined text-primary">terminal</span>
+<span class="absolute -top-1 -right-1 w-2 h-2 bg-primary rounded-full border border-background-dark"></span>
+</div>
+<span class="text-[10px] font-medium text-primary">Endpoints</span>
+</a>
+<a class="flex flex-col items-center gap-1 group" href="#">
+<span class="material-symbols-outlined text-slate-500 group-hover:text-primary transition-colors">description</span>
+<span class="text-[10px] font-medium text-slate-500 group-hover:text-primary">Docs</span>
+</a>
+<a class="flex flex-col items-center gap-1 group" href="#">
+<span class="material-symbols-outlined text-slate-500 group-hover:text-primary transition-colors">settings</span>
+<span class="text-[10px] font-medium text-slate-500 group-hover:text-primary">Settings</span>
+</a>
+</nav>
+<button class="fixed bottom-24 right-4 bg-primary text-background-dark w-12 h-12 rounded-full shadow-lg shadow-primary/20 flex items-center justify-center z-40">
+<span class="material-symbols-outlined">question_mark</span>
+</button>
+
+</body></html>
