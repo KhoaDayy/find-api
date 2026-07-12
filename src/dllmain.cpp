@@ -65,9 +65,17 @@ static void BootLog(const char *fmt, ...) {
   fclose(f);
 }
 
+// AllocConsole is a common anti-cheat tripwire. Only open if
+// GAMEHOOK_CONSOLE=1 is set in the process environment.
 static void TryOpenConsole() {
   if (g_consoleReady)
     return;
+  char env[8] = {};
+  if (GetEnvironmentVariableA("GAMEHOOK_CONSOLE", env, sizeof(env)) == 0 ||
+      env[0] != '1') {
+    BootLog("console disabled (set GAMEHOOK_CONSOLE=1 to enable)");
+    return;
+  }
   if (!AllocConsole()) {
     BootLog("AllocConsole failed err=%lu (continuing without console)",
             GetLastError());
@@ -183,12 +191,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (!g_initThread)
       BootLog("CreateThread failed err=%lu", GetLastError());
   } else if (reason == DLL_PROCESS_DETACH) {
-    BootLog("DllMain DETACH");
+    // Process teardown: do not touch hooks/heaps here. Detours may still be
+    // on other threads; MH_Uninitialize under loader lock is a crash source.
+    BootLog("DllMain DETACH (skip MH_Uninitialize)");
     g_running = false;
-    UninstallWinHttpCapture();
-    UninstallLuaRuntimeHook();
-    MH_Uninitialize();
-    ShutdownCaptureWriter();
   }
   return TRUE;
 }

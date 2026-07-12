@@ -78,10 +78,10 @@ cl /nologo /O2 /EHsc /MD /std:c++17 /DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE ^
 if errorlevel 1 goto :fail
 
 copy /Y "Scripts\face_share_logger.lua" "build\bin\Scripts\" >nul
-if exist "hook_config.example.json" copy /Y "hook_config.example.json" "build\bin\" >nul
-if exist "hook_config.json" (
-  copy /Y "hook_config.json" "build\bin\" >nul
-) else if exist "hook_config.example.json" (
+rem Always ship safe defaults (lua_hook OFF). Never overwrite with a local
+rem debug config that may re-enable pattern hooks and crash the game.
+if exist "hook_config.example.json" (
+  copy /Y "hook_config.example.json" "build\bin\hook_config.example.json" >nul
   copy /Y "hook_config.example.json" "build\bin\hook_config.json" >nul
 )
 goto :ok
@@ -97,10 +97,8 @@ if errorlevel 1 goto :fail
 g++ -O2 -std=c++17 src/injector.cpp -static -o build/bin/Injector.exe
 if errorlevel 1 goto :fail
 copy /Y Scripts\face_share_logger.lua build\bin\Scripts\ >nul
-if exist hook_config.example.json copy /Y hook_config.example.json build\bin\ >nul
-if exist hook_config.json (
-  copy /Y hook_config.json build\bin\ >nul
-) else if exist hook_config.example.json (
+if exist hook_config.example.json (
+  copy /Y hook_config.example.json build\bin\hook_config.example.json >nul
   copy /Y hook_config.example.json build\bin\hook_config.json >nul
 )
 goto :ok
@@ -117,15 +115,21 @@ echo   BUILD OK
 echo   build\bin\GameHook.dll
 echo   build\bin\Injector.exe
 echo   build\bin\Scripts\face_share_logger.lua
-echo   build\bin\hook_config.json
+echo   build\bin\hook_config.json  (lua_hook OFF by default)
 echo ============================================
 echo.
+echo IMPORTANT: do NOT use the old hook\GameHook.dll (Mar build).
+echo Use only build\bin\*
+echo.
 echo Usage:
-echo   1. Start game (see target_process in hook_config.json^)
+echo   1. Start game fully into world
 echo   2. Run build\bin\Injector.exe as Admin
-echo   3. F5 in console to re-inject Lua
+echo   3. Check build\bin\hook_boot.log  (no console by default)
 echo   4. In-game Face Share once
-echo   5. node scripts/parse_filepicker_capture.js build\bin\captures\face_share_capture.jsonl
+echo   5. captures in build\bin\captures\
+echo.
+echo Optional: set GAMEHOOK_CONSOLE=1 before inject for AllocConsole.
+echo Lua pattern hook stays OFF unless you edit hook_config.json.
 echo.
 exit /b 0
 
