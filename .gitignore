@@ -28,6 +28,14 @@ dist/
 # personal hook config (commit example only)
 hook_config.json
 
+# prebuilt binaries / local inject folders (CI artifacts & Releases only)
+hook/
+hook cn/
+*.dll
+*.exe
+*.bak
+*.bak_*
+
 # compiler junk
 *.obj
 *.exp
