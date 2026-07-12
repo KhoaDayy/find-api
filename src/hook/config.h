@@ -25,6 +25,8 @@ struct HookConfig {
   bool enable_lua_debug_hook = false;
   // If lua_load missing but lua_pcallk exact: install observe-only detour (no inject).
   bool enable_pcall_observer_when_loader_missing = false;
+  // AllocConsole + redirect stdout/stderr (also set by GAMEHOOK_CONSOLE=1).
+  bool enable_console = true;
 
   bool capture_only_filepicker = true;
   bool redact_secrets = true;

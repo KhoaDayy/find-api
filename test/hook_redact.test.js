@@ -158,6 +158,7 @@ test('session.txt is not part of default hook config', () => {
   assert.strictEqual(j.capture_dir, 'captures');
   assert.strictEqual(j.enable_lua_hook, true);
   assert.strictEqual(j.enable_winhttp_fallback, false);
+  assert.strictEqual(j.enable_console, true);
 });
 
 test('legacy api_logger is not the default script', () => {

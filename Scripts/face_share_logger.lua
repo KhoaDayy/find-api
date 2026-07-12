@@ -5,7 +5,7 @@
 -- No debug.sethook.
 ------------------------------------------------------------
 
-local LOGGER_VERSION = "1.1.0-lua-first"
+local LOGGER_VERSION = "1.2.0-diag"
 
 if _G.__face_share_logger_v1 then
   print("[FACE_CAP] already loaded")
@@ -15,6 +15,9 @@ _G.__face_share_logger_v1 = true
 
 local OUTPUT = _G.__FACE_CAPTURE_OUTPUT or "captures/face_share_capture.jsonl"
 local CAPTURE_FULL = _G.__FACE_CAPTURE_FULL == true
+local WRITER_BACKEND = "file" -- flipped to console_only if io missing
+local FILE_WRITE_OK = false
+local FILE_WRITE_ERR = nil
 
 local FACE_TAG = "_face_123_face_"
 local share_seq = 0
@@ -23,6 +26,27 @@ local hooked = {} -- [fn_identity] = true
 local install_deadline = os.clock() + 30
 local installed_count = 0
 local discovery_reported = {} -- [path] = true
+
+local IMPORTANT = {
+  logger_loaded = true,
+  logger_start = true,
+  hook_discovery = true,
+  hook_installed = true,
+  installer_done = true,
+  installer_timeout = true,
+  installer_no_timer = true,
+  face_share_enter = true,
+  face_share_start = true,
+  upload_plain_text_enter = true,
+  upload_plain_text = true,
+  token_rpc_request = true,
+  token_rpc_response = true,
+  real_upload_enter = true,
+  real_upload = true,
+  upload_callback = true,
+  filepicker_callback = true,
+  pict_url_found = true,
+}
 
 ------------------------------------------------------------
 -- Minimal JSON encoder (depth/item limited, cycle-safe)
@@ -137,8 +161,42 @@ local function encode(v)
   return '"' .. json_escape(tostring(v)) .. '"'
 end
 
+local function try_write_file(line)
+  if type(io) ~= "table" then
+    return false, "io=nil"
+  end
+  if type(io.open) ~= "function" then
+    return false, "io.open_type=" .. type(io.open)
+  end
+  local f, err = io.open(OUTPUT, "a")
+  if not f then
+    return false, "open_fail path=" .. tostring(OUTPUT) .. " err=" .. tostring(err)
+  end
+  local wok, werr = pcall(function()
+    f:write(line)
+    f:write("\n")
+  end)
+  local cok, cerr = pcall(function()
+    f:close()
+  end)
+  if not wok then
+    return false, "write_fail err=" .. tostring(werr)
+  end
+  if not cok then
+    return false, "close_fail err=" .. tostring(cerr)
+  end
+  return true, nil
+end
+
 local function emit(event, data)
   local ts = (os.time() or 0) * 1000
+  local payload = data or {}
+  if type(payload) == "table" then
+    payload = sanitize(payload)
+    if type(payload) == "table" then
+      payload.writer_backend = WRITER_BACKEND
+    end
+  end
   local row = {
     schema_version = 1,
     timestamp_ms = ts,
@@ -146,17 +204,30 @@ local function emit(event, data)
     event = event,
     share_id = current_share_id or "",
     region = "UNKNOWN",
-    data = sanitize(data or {}),
+    data = payload,
   }
   local line = encode(row)
-  pcall(function()
-    local f = io.open(OUTPUT, "a")
-    if f then
-      f:write(line .. "\n")
-      f:close()
+
+  -- Always print compact JSON for console diagnostics (never swallowed).
+  print("[FACE_CAP_JSON] " .. line)
+
+  local ok, err = try_write_file(line)
+  if ok then
+    FILE_WRITE_OK = true
+  else
+    FILE_WRITE_ERR = err
+    if WRITER_BACKEND ~= "console_only" then
+      -- stay on file attempts; mark console fallback for diagnostics
+      if type(io) ~= "table" or type(io.open) ~= "function" then
+        WRITER_BACKEND = "console_only"
+      end
     end
-  end)
-  print("[FACE_CAP] " .. event)
+    print("[FACE_CAP_EMIT_FAIL] " .. tostring(err))
+  end
+
+  if IMPORTANT[event] then
+    print("[FACE_CAP] " .. tostring(event))
+  end
 end
 
 ------------------------------------------------------------
@@ -511,20 +582,29 @@ local function resolve_path(root, dotted)
 end
 
 local function scan_and_hook()
+  local found_mods = {}
   for modname, mod in pairs(package.loaded) do
     if type(modname) == "string" and type(mod) == "table" then
       local mn = modname:lower()
       if mn:find("face_share", 1, true) then
+        found_mods[#found_mods + 1] = modname
+        print("[FACE_CAP_BOOT] package.loaded face_share: " .. modname)
         try_hook_FaceShare(mod, modname)
       end
       if mn:find("filepicker", 1, true) then
+        found_mods[#found_mods + 1] = modname
+        print("[FACE_CAP_BOOT] package.loaded filepicker: " .. modname)
         try_hook_FilePicker(mod, modname)
         try_hook_rpc_module(mod, modname)
       end
     end
   end
+  print("[FACE_CAP_BOOT] package.loaded hits=" .. tostring(#found_mods))
 
+  print("[FACE_CAP_BOOT] G type=" .. type(G))
   if type(G) == "table" then
+    print("[FACE_CAP_BOOT] G.filepicker_manager type=" .. type(G.filepicker_manager))
+    print("[FACE_CAP_BOOT] G.face_filepicker_manager type=" .. type(G.face_filepicker_manager))
     if type(G.filepicker_manager) == "table" then
       try_hook_FilePicker(G.filepicker_manager, "G.filepicker_manager")
     else
@@ -544,9 +624,10 @@ local function scan_and_hook()
             review = review,
           })
         end)
+    else
+      report_discovery("G.face_filepicker_manager", "*", false, false)
     end
 
-    -- Common manager paths (best-effort)
     local paths = {
       "filepicker_manager",
       "face_filepicker_manager",
@@ -554,40 +635,88 @@ local function scan_and_hook()
     }
     for _, p in ipairs(paths) do
       local obj = resolve_path(G, p)
+      print("[FACE_CAP_BOOT] G." .. p .. " type=" .. type(obj))
       if type(obj) == "table" and p:find("filepicker", 1, true) then
         try_hook_FilePicker(obj, "G." .. p)
       end
     end
+  else
+    report_discovery("G", "*", false, false)
   end
+
+  -- FaceShareController on globals / package
+  report_discovery("FaceShareController", "upload_face_data",
+    type(rawget(_G, "FaceShareController")) == "table"
+      and type((rawget(_G, "FaceShareController") or {}).upload_face_data) == "function",
+    false)
 end
 
 local function important_hooked()
-  -- At least one of the core upload entrypoints
   return installed_count >= 1
 end
 
 ------------------------------------------------------------
 -- Installer retry: 500ms, max 30s, no debug.sethook
 ------------------------------------------------------------
+print("[FACE_CAP_BOOT] logger_loaded")
+print("[FACE_CAP_BOOT] version=" .. LOGGER_VERSION)
+print("[FACE_CAP_BOOT] io_type=" .. type(io))
+print("[FACE_CAP_BOOT] io_open_type=" .. tostring(type(io) == "table" and type(io.open) or "n/a"))
+print("[FACE_CAP_BOOT] output=" .. tostring(OUTPUT))
+print("[FACE_CAP_BOOT] package.config=" .. tostring(package and package.config or "n/a"))
+do
+  local cwd = "?"
+  pcall(function()
+    if type(io) == "table" and type(io.popen) == "function" then
+      local p = io.popen("cd")
+      if p then
+        cwd = (p:read("*l") or "?"):gsub("%s+$", "")
+        p:close()
+      end
+    end
+  end)
+  print("[FACE_CAP_BOOT] cwd=" .. tostring(cwd))
+end
+
+if type(io) ~= "table" or type(io.open) ~= "function" then
+  WRITER_BACKEND = "console_only"
+  print("[FACE_CAP_BOOT] writer_backend=console_only (io unavailable)")
+end
+
 emit("logger_loaded", {
   logger = "face_share_logger",
   version = LOGGER_VERSION,
   output = OUTPUT,
   capture_full = CAPTURE_FULL,
+  writer_backend = WRITER_BACKEND,
+  io_type = type(io),
+  io_open_type = type(io) == "table" and type(io.open) or "n/a",
 })
-emit("logger_start", { output = OUTPUT, capture_full = CAPTURE_FULL, version = LOGGER_VERSION })
+emit("logger_start", {
+  output = OUTPUT,
+  capture_full = CAPTURE_FULL,
+  version = LOGGER_VERSION,
+  writer_backend = WRITER_BACKEND,
+})
 
 local function installer()
   if os.clock() > install_deadline then
     emit("installer_timeout", {
       installed_count = installed_count,
       important_hooked = important_hooked(),
+      writer_backend = WRITER_BACKEND,
+      file_write_ok = FILE_WRITE_OK,
+      file_write_err = FILE_WRITE_ERR,
     })
     return
   end
   pcall(scan_and_hook)
   if important_hooked() and installed_count >= 3 then
-    emit("installer_done", { installed_count = installed_count })
+    emit("installer_done", {
+      installed_count = installed_count,
+      writer_backend = WRITER_BACKEND,
+      file_write_ok = FILE_WRITE_OK,
+    })
     _G.__face_share_logger_rescan = scan_and_hook
     return
   end
@@ -600,13 +729,15 @@ local function installer()
     end
   end)
   if not scheduled then
-    -- No game timer: rely on F5 re-inject / manual rescan.
-    -- Avoid debug.sethook (explicitly disabled).
+    emit("installer_no_timer", {
+      installed_count = installed_count,
+      note = "call __face_share_logger_rescan() or F5 reinject",
+    })
   end
   _G.__face_share_logger_rescan = scan_and_hook
 end
 
 installer()
-print("[FACE_CAP] face_share_logger " .. LOGGER_VERSION .. " loaded; scanning package.loaded")
-print("[FACE_CAP] output=" .. OUTPUT)
-print("[FACE_CAP] call __face_share_logger_rescan() or F5 reinject to rescan modules")
+print("[FACE_CAP_BOOT] face_share_logger " .. LOGGER_VERSION .. " loaded; scanning package.loaded")
+print("[FACE_CAP_BOOT] call __face_share_logger_rescan() or F5 reinject to rescan modules")
+print("[FACE_CAP_BOOT] file_write_ok=" .. tostring(FILE_WRITE_OK) .. " err=" .. tostring(FILE_WRITE_ERR))

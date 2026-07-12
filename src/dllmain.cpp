@@ -63,13 +63,15 @@ static void BootLog(const char *fmt, ...) {
   fclose(f);
 }
 
-static void TryOpenConsole() {
+static void TryOpenConsole(bool forceFromConfig) {
   if (g_consoleReady)
     return;
   char env[8] = {};
-  if (GetEnvironmentVariableA("GAMEHOOK_CONSOLE", env, sizeof(env)) == 0 ||
-      env[0] != '1') {
-    BootLog("console disabled (set GAMEHOOK_CONSOLE=1 to enable)");
+  bool envOn =
+      GetEnvironmentVariableA("GAMEHOOK_CONSOLE", env, sizeof(env)) > 0 &&
+      env[0] == '1';
+  if (!forceFromConfig && !envOn) {
+    BootLog("console disabled (enable_console / GAMEHOOK_CONSOLE=1)");
     return;
   }
   if (!AllocConsole()) {
@@ -83,6 +85,7 @@ static void TryOpenConsole() {
   freopen_s(&fp, "CONIN$", "r", stdin);
   SetConsoleTitleA("Face Share Capture Hook");
   g_consoleReady = true;
+  BootLog("console enabled");
 }
 
 static void ConPrint(const char *fmt, ...) {
@@ -295,9 +298,11 @@ static int SehCall(const char *name, int (*fn)()) {
   return rc;
 }
 
+static bool g_consoleWanted = false;
+
 static int SehTryOpenConsole() {
   __try {
-    TryOpenConsole();
+    TryOpenConsole(g_consoleWanted);
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     BootLog("TryOpenConsole SEH code=0x%08lX", GetExceptionCode());
     return -1;
@@ -313,6 +318,12 @@ static int RunStep(const char *name, int (*fn)()) {
 static DWORD WINAPI InitThread(LPVOID) {
   Sleep(3000);
 
+  // Config first so enable_console is known, then optional AllocConsole.
+  if (RunStep("load_config", Step_LoadConfig) < 0) {
+    BootLog("FATAL: load_config crashed — abort init");
+    return 1;
+  }
+  g_consoleWanted = g_cfg.enable_console;
   SehTryOpenConsole();
 
   ConPrint("========================================");
@@ -320,14 +331,11 @@ static DWORD WINAPI InitThread(LPVOID) {
   ConPrint("  Passive only — Lua-first, no mutation");
   ConPrint("========================================");
 
-  if (RunStep("load_config", Step_LoadConfig) < 0) {
-    BootLog("FATAL: load_config crashed — abort init");
-    return 1;
-  }
   ConPrint("DLL dir: %s", g_dllDir.c_str());
-  ConPrint("Config: lua_hook=%d winhttp_fallback=%d script=%s capture_dir=%s",
+  ConPrint("Config: lua_hook=%d winhttp_fallback=%d console=%d script=%s capture_dir=%s",
            g_cfg.enable_lua_hook ? 1 : 0, g_cfg.enable_winhttp_fallback ? 1 : 0,
-           g_cfg.lua_script.c_str(), g_cfg.capture_dir.c_str());
+           g_cfg.enable_console ? 1 : 0, g_cfg.lua_script.c_str(),
+           g_cfg.capture_dir.c_str());
   ConPrint("Boot log: %shook_boot.log", g_dllDir.c_str());
   ConPrint("========================================");
 
