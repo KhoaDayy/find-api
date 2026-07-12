@@ -287,37 +287,55 @@ bool HookOne(HMODULE h, const char *name, LPVOID detour, LPVOID *orig) {
 
 } // namespace
 
-bool InstallWinHttpCapture(const HookConfig &cfg) {
+// outReason: optional short ASCII reason for boot log (never LoadLibrary —
+// only hook if the game already mapped winhttp.dll).
+bool InstallWinHttpCapture(const HookConfig &cfg, char *outReason, size_t reasonN) {
+  auto fail = [&](const char *why) -> bool {
+    if (outReason && reasonN)
+      _snprintf_s(outReason, reasonN, _TRUNCATE, "%s", why);
+    return false;
+  };
+
   g_cfg = cfg;
-  // Do not LoadLibrary winhttp if the game never loaded it — injecting a new
-  // network DLL mid-run can trip AC. Only hook if already mapped.
   HMODULE h = GetModuleHandleA("winhttp.dll");
   if (!h)
-    return false;
+    return fail("winhttp.dll not loaded yet");
 
   oQueryHeaders = (WinHttpQueryHeaders_fn)GetProcAddress(h, "WinHttpQueryHeaders");
 
-  bool any = false;
-  any |= HookOne(h, "WinHttpConnect", (LPVOID)&Detour_Connect, (LPVOID *)&oConnect);
-  any |= HookOne(h, "WinHttpOpenRequest", (LPVOID)&Detour_OpenRequest, (LPVOID *)&oOpenRequest);
-  any |= HookOne(h, "WinHttpAddRequestHeaders", (LPVOID)&Detour_AddRequestHeaders,
-                 (LPVOID *)&oAddHeaders);
-  any |= HookOne(h, "WinHttpSendRequest", (LPVOID)&Detour_SendRequest, (LPVOID *)&oSendRequest);
-  any |= HookOne(h, "WinHttpWriteData", (LPVOID)&Detour_WriteData, (LPVOID *)&oWriteData);
-  any |= HookOne(h, "WinHttpReceiveResponse", (LPVOID)&Detour_ReceiveResponse,
-                 (LPVOID *)&oReceiveResponse);
-  any |= HookOne(h, "WinHttpReadData", (LPVOID)&Detour_ReadData, (LPVOID *)&oReadData);
-  any |= HookOne(h, "WinHttpCloseHandle", (LPVOID)&Detour_CloseHandle, (LPVOID *)&oCloseHandle);
+  int created = 0;
+  if (HookOne(h, "WinHttpConnect", (LPVOID)&Detour_Connect, (LPVOID *)&oConnect))
+    created++;
+  if (HookOne(h, "WinHttpOpenRequest", (LPVOID)&Detour_OpenRequest, (LPVOID *)&oOpenRequest))
+    created++;
+  if (HookOne(h, "WinHttpAddRequestHeaders", (LPVOID)&Detour_AddRequestHeaders,
+              (LPVOID *)&oAddHeaders))
+    created++;
+  if (HookOne(h, "WinHttpSendRequest", (LPVOID)&Detour_SendRequest, (LPVOID *)&oSendRequest))
+    created++;
+  if (HookOne(h, "WinHttpWriteData", (LPVOID)&Detour_WriteData, (LPVOID *)&oWriteData))
+    created++;
+  if (HookOne(h, "WinHttpReceiveResponse", (LPVOID)&Detour_ReceiveResponse,
+              (LPVOID *)&oReceiveResponse))
+    created++;
+  if (HookOne(h, "WinHttpReadData", (LPVOID)&Detour_ReadData, (LPVOID *)&oReadData))
+    created++;
+  if (HookOne(h, "WinHttpCloseHandle", (LPVOID)&Detour_CloseHandle, (LPVOID *)&oCloseHandle))
+    created++;
 
-  if (!any)
-    return false;
+  if (!created)
+    return fail("MH_CreateHook got 0 exports");
 
   // Single enable pass for all pending hooks.
   if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK)
-    return false;
+    return fail("MH_EnableHook(MH_ALL_HOOKS) failed");
+
+  if (outReason && reasonN)
+    _snprintf_s(outReason, reasonN, _TRUNCATE, "ok hooks=%d", created);
 
   WriteCaptureEvent("winhttp", "winhttp_hooks_installed",
-                    std::string("{\"ok\":true,\"capture_only_filepicker\":") +
+                    std::string("{\"ok\":true,\"hooks\":") + std::to_string(created) +
+                        ",\"capture_only_filepicker\":" +
                         (cfg.capture_only_filepicker ? "true" : "false") + "}");
   return true;
 }

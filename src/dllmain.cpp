@@ -131,15 +131,50 @@ static int Step_MinHook() {
   return 0;
 }
 
+// Polls in a side thread so InitThread stays responsive (F5 etc.).
+static DWORD WINAPI WinHttpWaitThread(LPVOID) {
+  char reason[128] = {};
+  const int maxTries = 120; // ~2 min
+  for (int i = 0; i < maxTries && InterlockedCompareExchange(&g_running, 1, 1) == 1;
+       i++) {
+    if (GetModuleHandleA("winhttp.dll")) {
+      if (InstallWinHttpCapture(g_cfg, reason, sizeof(reason))) {
+        ConPrint("[+] WinHTTP capture installed (%s) after %ds", reason, i);
+      } else {
+        ConPrint("[!] WinHTTP present but install failed: %s", reason);
+      }
+      return 0;
+    }
+    if (i == 0 || (i + 1) % 15 == 0)
+      ConPrint("[*] waiting for winhttp.dll ... %ds", i);
+    Sleep(1000);
+  }
+  if (InterlockedCompareExchange(&g_running, 1, 1) == 1)
+    ConPrint("[!] WinHTTP capture skipped: winhttp.dll never loaded");
+  return 0;
+}
+
 static int Step_WinHttp() {
   if (!g_cfg.enable_winhttp_hook) {
     ConPrint("[*] WinHTTP capture disabled by config");
     return 0;
   }
-  if (InstallWinHttpCapture(g_cfg))
-    ConPrint("[+] WinHTTP capture installed (filepicker allowlist)");
+  // Fast path if already mapped.
+  if (GetModuleHandleA("winhttp.dll")) {
+    char reason[128] = {};
+    if (InstallWinHttpCapture(g_cfg, reason, sizeof(reason))) {
+      ConPrint("[+] WinHTTP capture installed (%s)", reason);
+      return 0;
+    }
+    ConPrint("[!] WinHTTP install failed: %s", reason);
+    return 0;
+  }
+  ConPrint("[*] winhttp.dll not loaded yet — background wait started");
+  HANDLE h = CreateThread(nullptr, 0, WinHttpWaitThread, nullptr, 0, nullptr);
+  if (h)
+    CloseHandle(h);
   else
-    ConPrint("[!] WinHTTP capture failed (non-fatal)");
+    ConPrint("[!] failed to start winhttp wait thread err=%lu", GetLastError());
   return 0;
 }
 
