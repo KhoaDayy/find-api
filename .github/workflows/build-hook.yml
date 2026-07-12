@@ -3,6 +3,7 @@ name: Build Windows Hook
 on:
   workflow_dispatch:
   push:
+    branches: [main]
     paths:
       - "src/hook/**"
       - "src/dllmain.cpp"
@@ -17,7 +18,7 @@ on:
       - ".github/workflows/build-hook.yml"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-hook:
@@ -71,46 +72,96 @@ jobs:
           call build.bat
           if errorlevel 1 exit /b 1
 
-      - name: Ensure example config in output
+      - name: Package release zip
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $bin = "build/bin"
           if (-not (Test-Path $bin)) { throw "Missing build/bin" }
+
           if (Test-Path "hook_config.example.json") {
             Copy-Item "hook_config.example.json" (Join-Path $bin "hook_config.example.json") -Force
+            if (-not (Test-Path (Join-Path $bin "hook_config.json"))) {
+              Copy-Item "hook_config.example.json" (Join-Path $bin "hook_config.json") -Force
+            }
           }
-          if (-not (Test-Path (Join-Path $bin "hook_config.json")) -and (Test-Path "hook_config.example.json")) {
-            Copy-Item "hook_config.example.json" (Join-Path $bin "hook_config.json") -Force
-          }
-          # Do not ship empty captures as secrets; keep directory only
+
           $cap = Join-Path $bin "captures"
           if (-not (Test-Path $cap)) { New-Item -ItemType Directory -Path $cap | Out-Null }
 
-      - name: Verify output
-        shell: pwsh
-        run: |
-          if (-not (Test-Path "build/bin")) {
-            throw "Missing build/bin directory"
-          }
-
-          $dll = Get-ChildItem "build/bin" -Recurse -Filter "GameHook.dll" | Select-Object -First 1
-          $injector = Get-ChildItem "build/bin" -Recurse -Filter "Injector.exe" | Select-Object -First 1
-          $lua = Get-ChildItem "build/bin" -Recurse -Filter "face_share_logger.lua" | Select-Object -First 1
-
+          $dll = Get-ChildItem $bin -Recurse -Filter "GameHook.dll" | Select-Object -First 1
+          $injector = Get-ChildItem $bin -Recurse -Filter "Injector.exe" | Select-Object -First 1
+          $lua = Get-ChildItem $bin -Recurse -Filter "face_share_logger.lua" | Select-Object -First 1
           if (-not $dll) { throw "GameHook.dll not found" }
           if (-not $injector) { throw "Injector.exe not found" }
-          if (-not $lua) { throw "face_share_logger.lua not found in output" }
+          if (-not $lua) { throw "face_share_logger.lua not found" }
 
           Write-Host "DLL: $($dll.FullName) — $($dll.Length) bytes"
           Write-Host "Injector: $($injector.FullName) — $($injector.Length) bytes"
           Write-Host "Lua: $($lua.FullName) — $($lua.Length) bytes"
-          Get-ChildItem "build/bin" -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+          Get-ChildItem $bin -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          $zipName = "wwm-face-share-hook-$env:GITHUB_SHA.zip"
+          $zipPath = Join-Path "dist" $zipName
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path (Join-Path $bin '*') -DestinationPath $zipPath -Force
+          Write-Host "Packaged $zipPath ($((Get-Item $zipPath).Length) bytes)"
+          "ZIP_PATH=$zipPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Upload hook artifact
         uses: actions/upload-artifact@v4
         with:
           name: wwm-face-share-hook-${{ github.sha }}
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
           path: |
             build/bin/**
+            dist/*.zip
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sha = $env:GITHUB_SHA
+          $short = $sha.Substring(0, 7)
+          $tag = "hook-$short"
+          $zip = $env:ZIP_PATH
+          if (-not (Test-Path $zip)) { throw "Release zip missing: $zip" }
+
+          $title = "Face Share Hook $short"
+          $notes = @"
+          PassivePassive face FilePicker share capture** (x64 Windows)
+
+          - Commit: ``$sha``
+          - Contents: ``GameHook.dll``, ``Injector.exe``, ``Scripts/face_share_logger.lua``, ``hook_config.json``
+          - Capture only — no live upload / token replay
+
+          ## Usage
+          1. Unzip next to each other
+          2. Start game (``yysls.exe`` / ``wwm.exe``)
+          3. Run ``Injector.exe`` as Administrator
+          4. Press F5 in the hook console if needed
+          5. In-game: Face Share once
+          6. Parse: ``node scripts/parse_filepicker_capture.js captures/face_share_capture.jsonl``
+
+          See ``docs/HOOK_FACE_SHARE_CAPTURE.md``.
+          "@
+
+          # Replace release if tag already exists (re-run / amend)
+          $existing = gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Deleting existing release $tag"
+            gh release delete $tag --yes --cleanup-tag
+          }
+
+          gh release create $tag $zip `
+            --title $title `
+            --notes $notes `
+            --latest=false
+
+          Write-Host "Created release $tag"
