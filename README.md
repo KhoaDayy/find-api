@@ -1,199 +1,205 @@
-# Where Winds Meet (WWM) API Explorer
+# find-api
 
-A premium, high-performance API Explorer and Backend Service for the "Where Winds Meet" game. This project provides a bridge between game data and external applications (like Discord bots) while offering a beautiful web interface for manual lookups.
+Tools for **Where Winds Meet** profile / face data research:
 
-## 🚀 Features
+| Area | What it does |
+|------|----------------|
+| **Face API** | Inventory, cache, and short-code resolve (Node) |
+| **Game hook** | Passive in-process capture of Face Share → FilePicker |
+| **Legacy explorer** | Simple player / club lookup UI |
 
-- **Player Lookup**: Search for players by **Number ID** or **Nickname** across multiple game regions (SEA & CN).
-- **Club Search**: Query global guilds, martial arts clubs, and player associations.
-- **Auto-Server Search**: Intelligent parallel searching across all known server regions with extremely low latency.
-- **Face Plan Converter**: Migration tool for legacy face plan data.
-- **Premium UI**: iOS-style glassmorphic dashboard with real-time JSON syntax highlighting and mobile-first design.
-- **Data Enrichment**: Fetching extra details including fashion scores, cover images, online status, and character portraits.
+Educational / research use only. Respect the game ToS and only use **your own** session and accounts.
 
-## 🛠 Tech Stack
+---
 
-- **Backend**: Node.js, Express.js
-- **Data Protocol**: Msgpack (MessagePack) integration for game-native communication.
-- **Networking**: Custom DNS caching and HTTPS agent for optimized API calls.
-- **Frontend**: Tailwind CSS, Vanilla JavaScript, Glassmorphism Aesthetics.
+## Quick start (Face API)
 
-## 📦 Installation
+```bash
+git clone https://github.com/KhoaDayy/find-api.git
+cd find-api
+npm install
+```
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/KhoaDayy/find-api.git
-   cd find-api
-   ```
+Create `.env` (never commit it):
 
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
+```env
+WWM_SESSION_KEY_CN=...
+WWM_SESSION_KEY_GLOBAL=...
+# or GAME_SESSION=... for both
 
-3. Configure your session:
-   Create a `session.txt` file in the root directory and paste your valid game session key.
+DATABASE_PATH=./data/faces.db
+ENABLE_FACE_CACHE=true
+CACHE_STORE_LONG_CODE=true
+ENABLE_LIVE_FACE_UPLOAD=false
+UPLOAD_SCHEMA_VERIFIED=false
+```
 
-4. Start the server:
-   ```bash
-   node player_api.js
-   ```
+```bash
+npm test
+npm run start:wwm
+# → http://localhost:3005
+```
 
-## 🖥 API Endpoints
+| Check | |
+|-------|--|
+| `GET /health` | Process up |
+| `GET /ready` | DB + session flags (no secrets) |
 
-Legacy (`node player_api.js`, port 3003):
+---
 
-- **GET `/lookup?name={nickname}`**: Search player by name.
-- **GET `/lookup?id={number_id}`**: Search player by ID.
-- **GET `/club_search?name={club_name}`**: Search for a club/guild.
-- **GET `/id?keyword={text}`**: Intelligent redirect based on input type (Numeric ID vs Name).
+## Face API (`npm run start:wwm`)
 
-WWM face inventory (`npm run start:wwm`, port 3005):
+### Inventory
 
-- **GET `/face_inventory?id={number_id}&server=CN|SEA`**
-- **GET `/face_inventory?name={nickname}&server=CN|SEA`**
+```http
+GET /face_inventory?id={number_id}&server=CN|SEA
+GET /face_inventory?name={nickname}&server=CN|SEA
+```
 
-Optional query:
-
-| Param | Default | Meaning |
-|-------|---------|---------|
+| Query | Default | Description |
+|-------|---------|-------------|
 | `type` | `all` | `all` \| `face` \| `makeup` \| `unknown` |
-| `include_long_code` | `1` | `0` drops long payload but keeps hash/length |
-| `include_raw` | `0` | redacted plan raw |
-| `include_empty_plans` | `0` | plans without `view_data.face_data` |
-| `persist` | `1` if cache on | write inventory into SQLite cache |
+| `include_long_code` | `1` | `0` keeps hash/length only |
+| `include_raw` | `0` | Redacted plan raw |
+| `include_empty_plans` | `0` | Plans without face payload |
+| `persist` | on if cache enabled | Write to SQLite |
 
-Cache (local SQLite):
+Community inventory → long face codes (`R67` / `D67`).  
+Does **not** invent FilePicker short codes from `plan_id`.
 
-- **GET `/face_cache/:faceHash`**
-- **GET `/face_cache/lookup?alias=ART...|plan_id|short|sha256:...`**
+### Cache
 
-Short-code resolve (CDN download, **no upload**):
-
-- **POST `/face_resolve`** body `{ "input": "wwm_facedata_R37_...", "include_long_code": true, "persist": true }`
-- **GET `/face_resolve?code=...`**
-
-Verified live: Global + China short codes for the same face return identical `face_hash` and map to one faces row with two `regional_codes` (status `verified`).
-
-FilePicker JSON wrapper (C5.1) for share objects is typically:
-
-```json
-{ "pid", "face_data", "dressing", "hostnum", "face_share_type" }
+```http
+GET /face_cache/:faceHash
+GET /face_cache/lookup?alias=ART...|plan_id|short|sha256:...
 ```
 
-- Face payload path: `$.face_data`
-- **No `plan_id`** in wrapper → no automatic ART alias from short code alone
-- Global wrapper embeds the **same CN `pid` + `hostnum`** as China → bot can show CN Author UID when input is Global (`metadata_source: global_filepicker_wrapper.cn_source_metadata`)
-- Owner role is `filepicker_metadata_owner`, **not** `original_author`
+### Short-code resolve (CDN read-only)
 
-Diagnostic:
+```http
+POST /face_resolve
+Content-Type: application/json
+
+{ "input": "wwm_facedata_R37_...", "include_long_code": true, "persist": true }
+```
+
+Also: `GET /face_resolve?code=...`
+
+| Fact (live-verified) | |
+|----------------------|--|
+| Global + China short codes can share one `face_hash` | |
+| CDN object is often JSON: `pid`, `face_data`, `dressing`, `hostnum`, `face_share_type` | |
+| Face payload path | `$.face_data` |
+| Global wrappers may embed CN `pid`/`hostnum` | metadata role: `filepicker_metadata_owner` (not “original author”) |
+
+### Diagnostics
 
 ```bash
-node scripts/inspect_filepicker_object.js --compare
+npm run inspect:face -- --server CN --id 0111452488
+npm run inspect:fp -- --compare
+npm run parse:capture -- path/to/capture.har
 ```
 
-### FilePicker upload (C6 — capture only, no live send)
+### Upload status
 
-Static trace: `docs/C6_UPLOAD_STATIC_TRACE.md`
+Out-of-game FilePicker **upload is not enabled**.
+
+Dry-run builders and capture parsing only:
 
 ```bash
-# Dry-run token / upload request models (never sends)
-node scripts/parse_filepicker_capture.js --dry-run-token --region CN
-node scripts/parse_filepicker_capture.js --dry-run-upload --region GLOBAL --body-json path/to/wrapper.json
-
-# Parse a HAR / JSON / log capture from your own client (tokens redacted)
-node scripts/parse_filepicker_capture.js path/to/capture.har
-node scripts/parse_filepicker_capture.js path/to/capture.json --correlate debug/filepicker-CN-....json
+node Scripts/parse_filepicker_capture.js --dry-run-token --region CN
+node Scripts/parse_filepicker_capture.js capture.jsonl
 ```
 
-Live upload requires **both**:
+Live send requires **both** (default off):
 
-```
+```env
 ENABLE_LIVE_FACE_UPLOAD=true
 UPLOAD_SCHEMA_VERIFIED=true
 ```
 
-Default both false. Schema is **not** verified until a real capture proves Content-Type + token placement + body shape.
+Do not set `UPLOAD_SCHEMA_VERIFIED` until a real in-game Share capture proves Content-Type, token placement, and body shape. See [docs/C6_UPLOAD_STATIC_TRACE.md](docs/C6_UPLOAD_STATIC_TRACE.md).
 
-Health:
+---
 
-- **GET `/health`** — process up
-- **GET `/ready`** — DB integrity + session presence (booleans only, no secrets)
+## Game hook (passive capture)
 
-Env:
+Injected logger for the Face Share → FilePicker path. **Observe only** — no return-value edits, no token replay.
 
-```
-DATABASE_PATH=./data/faces.db
-ENABLE_FACE_CACHE=true
-CACHE_STORE_LONG_CODE=true
-```
+### Download (no local compiler)
 
-`CACHE_STORE_LONG_CODE=false` still stores hashes/metadata/aliases/codes but omits long payload (`[omitted]`) — re-ingest with long code needed later to fill.
-
-**Not implemented yet:** FilePicker upload / token / creating new short codes.
-
-### Face inventory notes (important)
-
-- This is **community inventory → long Face Data** (`R67` / `D67`).
-- It does **not** return FilePicker face short codes (`wwm_facedata_R37_*` / `yysls_facedata_R37_*`).
-- `plan_id` is **not** a FilePicker object key. Do not build short codes from it.
-- `picture_url` is a **preview asset**; `preview_object_key` is only parsed from that URL.
-- Active equipped slot is currently **unknown** (`is_active: null`) — designer/redis do not expose a confirmed index in samples.
-- Plan author (`plan.pid` → redis `number_id`) is **not** necessarily the player currently using the plan.
-
-Diagnostic CLI (raw schema, no HTTP):
+1. Open [Releases](https://github.com/KhoaDayy/find-api/releases) or [Actions → Build Windows Hook](https://github.com/KhoaDayy/find-api/actions/workflows/build-hook.yml)
+2. Download the latest `wwm-face-share-hook-*.zip` / artifact
+3. Unzip so `GameHook.dll`, `Injector.exe`, `Scripts/`, and config sit together
+4. Start the game (`yysls.exe` / `wwm.exe` per config)
+5. Run `Injector.exe` as Administrator → F5 in the console if needed
+6. Trigger **Face Share** once in-game
+7. Parse:
 
 ```bash
-node scripts/inspect_player_face.js --server CN --id 0111452488
+node Scripts/parse_filepicker_capture.js captures/face_share_capture.jsonl
 ```
 
-## 📂 Project Structure
+Copy `hook_config.example.json` → `hook_config.json` for local overrides (gitignored).
 
-- `player_api.js` + `index.html`: Legacy player/club explorer (port 3003).
-- `src/wwm/`: Face inventory / cache / resolve API (port 3005).
-- `src/parsers/`, `src/storage/`, `test/`: parsers, SQLite cache, unit tests.
-- `src/hook/`: Face share capture C++ (config, WinHTTP, Lua inject, redact).
-- `Scripts/face_share_logger.lua`: Default passive Lua logger.
-- `hook_config.example.json`: Config template (copy to `hook_config.json` locally).
-- `Scripts/inspect_*.js`, `Scripts/parse_filepicker_capture.js`: diagnostics / capture parser.
-- `docs/HOOK_FACE_SHARE_CAPTURE.md`, `docs/C6_UPLOAD_STATIC_TRACE.md`.
-- Legacy only (not default): `Scripts/api_logger.lua`.
+### Build locally
 
-### Game hook (passive capture)
-
-Local (requires VS Build Tools x64 or MinGW g++):
+Requires Visual Studio Build Tools (x64) or MinGW:
 
 ```bat
 build.bat
-:: output: build\bin\GameHook.dll, Injector.exe, Scripts\, hook_config.json
+:: → build\bin\
 ```
 
-**Cloud build (no local compiler):**
+Details: [docs/HOOK_FACE_SHARE_CAPTURE.md](docs/HOOK_FACE_SHARE_CAPTURE.md).
 
-1. GitHub → **Actions** → **Build Windows Hook**
-2. **Run workflow** (`workflow_dispatch`) or push changes under `src/hook/**`, `build.bat`, etc.
-3. When the run succeeds, open the run → **Artifacts** → download `wwm-face-share-hook-<sha>`
-4. Unzip → run `Injector.exe` next to `GameHook.dll` (as Admin) while the game is running
-5. In-game Face Share once → parse:
-
-```bash
-node scripts/parse_filepicker_capture.js captures/face_share_capture.jsonl
-```
-
-Copy `hook_config.example.json` to `hook_config.json` if needed (personal config is gitignored).
-
-See `docs/HOOK_FACE_SHARE_CAPTURE.md` and `docs/C6_UPLOAD_STATIC_TRACE.md`.
-
-**Safety**
-
-- Capture is **passive logging only** (no return-value edits, no token replay).
-- Upload schema is **not verified** until you have a real JSONL from in-game Share.
-- Do **not** set `UPLOAD_SCHEMA_VERIFIED=true` before that runtime verification.
-- Never commit `session.txt`, `.env`, raw captures, or full Face Data.
-
-## ⚠️ Disclaimer
-
-This tool is designed for educational and data exploration purposes. Please ensure compliance with the game's terms of service.
+CI also publishes a GitHub Release (`hook-<shortsha>`) on successful `main` builds.
 
 ---
-Developed for the **Where Winds Meet** community.
+
+## Legacy player explorer
+
+```bash
+# session.txt or env — your key only
+node player_api.js
+# → http://localhost:3003
+```
+
+| Endpoint | |
+|----------|--|
+| `GET /lookup?id=` / `?name=` | Player search |
+| `GET /club_search?name=` | Club search |
+| `GET /id?keyword=` | Redirect helper |
+
+UI: `index.html`.
+
+---
+
+## Layout
+
+```
+src/wwm/           Face inventory, cache, resolve API
+src/hook/          C++ capture modules (WinHTTP + Lua inject)
+src/storage/       SQLite face cache
+src/parsers/       Short-code / long-face parsers
+Scripts/           face_share_logger.lua + JS diagnostics
+test/              Unit tests (npm test)
+docs/              Hook + upload static analysis
+build.bat          Local MSVC/MinGW hook build
+.github/workflows  Windows x64 hook CI + Releases
+```
+
+---
+
+## Safety
+
+- Use only **your** session / accounts.
+- Never commit `session.txt`, `.env`, databases, raw captures, or full face payloads.
+- Hook capture redacts tokens, sessions, and long face data by default.
+- Prebuilt DLLs are **not** in the git tree — use Releases / Actions only.
+
+---
+
+## License / disclaimer
+
+Research tooling for personal education. Not affiliated with NetEase. You are responsible for compliance with applicable terms and law.
