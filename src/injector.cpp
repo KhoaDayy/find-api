@@ -188,10 +188,47 @@ int wmain(int argc, wchar_t **argv) {
     return 1;
   }
 
-  WaitForSingleObject(hThread, INFINITE);
+  printf("[*] Waiting for LoadLibraryW remote thread...\n");
+  DWORD wait = WaitForSingleObject(hThread, 15000);
+  if (wait != WAIT_OBJECT_0) {
+    printf("[!] Remote thread wait failed/timeout (wait=%lu err=%lu)\n", wait,
+           GetLastError());
+  }
+
+  DWORD remoteExit = 0;
+  if (!GetExitCodeThread(hThread, &remoteExit)) {
+    printf("[!] GetExitCodeThread failed (err %lu)\n", GetLastError());
+  } else {
+    // LoadLibraryW returns HMODULE in exit code (low 32 bits on x64)
+    printf("[*] LoadLibraryW exit code = 0x%08lX\n", remoteExit);
+    if (remoteExit == 0) {
+      printf("[!] LoadLibraryW returned NULL — DLL failed to load in the game.\n");
+      printf("    Common causes:\n");
+      printf("    - GameHook.dll not next to Injector.exe\n");
+      printf("    - Missing runtime (VS Redistributable x64)\n");
+      printf("    - Anti-cheat blocked LoadLibrary\n");
+      printf("    - Wrong arch (must be x64)\n");
+    } else {
+      printf("[+] DLL module handle looks non-null (inject call succeeded).\n");
+      printf("    If the GAME still closed: GameHook init crashed inside the process.\n");
+      printf("    Check hook_boot.log next to GameHook.dll after restarting the game.\n");
+    }
+  }
+
+  // Confirm game process still alive
+  DWORD procCode = STILL_ACTIVE;
+  if (GetExitCodeProcess(hProc, &procCode) && procCode != STILL_ACTIVE) {
+    printf("[!] Game process exited during inject (code=%lu).\n", procCode);
+    printf("    That usually means the DLL crashed the game on load/init.\n");
+  } else {
+    printf("[+] Game process still running.\n");
+  }
+
   CloseHandle(hThread);
   VirtualFreeEx(hProc, pRemote, 0, MEM_RELEASE);
   CloseHandle(hProc);
 
+  printf("\nDone. Press any key to close Injector...\n");
+  system("pause");
   return 0;
 }

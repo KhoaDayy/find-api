@@ -19,10 +19,16 @@ Outputs (under `build\bin` or `build\Release`):
 
 1. Copy the entire output folder together (DLL + Injector + Scripts + config).
 2. Start the game (`target_process` in `hook_config.json`, default `yysls.exe`; injector also tries `wwm.exe`).
-3. Run `Injector.exe` as Administrator.
-4. Console: F5 re-injects Lua logger (e.g. after loading character).
-5. In-game: open **Face Share** once (the flow that uploads face data).
-6. Capture file: `captures/face_share_capture.jsonl`
+3. Wait until you are fully in the world (not launcher/login splash).
+4. Run `Injector.exe` as Administrator from the **same folder** as `GameHook.dll`.
+5. Read Injector output:
+   - `LoadLibraryW exit code = 0` → DLL did not load (path/AC/redistributable).
+   - Game process exits → DLL init crashed; open `hook_boot.log` next to the DLL.
+6. If a console titled **Face Share Capture Hook** appears, init survived.
+7. Default config has `enable_lua_hook: false` (WinHTTP-only, safer). Set `true` only after WinHTTP works.
+8. In-game: open **Face Share** once.
+9. Capture file: `captures/face_share_capture.jsonl`  
+   Boot diagnostics: `hook_boot.log`
 
 ## Parse
 

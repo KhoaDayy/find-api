@@ -7,7 +7,9 @@ struct HookConfig {
   std::string target_process = "yysls.exe";
   std::string lua_script = "Scripts/face_share_logger.lua";
   std::string output_file = "captures/face_share_capture.jsonl";
-  bool enable_lua_hook = true;
+  // Lua pattern hooks are game-build specific and can crash if signatures drift.
+  // Default OFF: WinHTTP allowlist capture is enough for FilePicker POST bodies.
+  bool enable_lua_hook = false;
   bool enable_winhttp_hook = true;
   bool capture_only_filepicker = true;
   bool redact_secrets = true;

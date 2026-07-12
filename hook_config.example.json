@@ -2,7 +2,7 @@
   "target_process": "yysls.exe",
   "lua_script": "Scripts/face_share_logger.lua",
   "output_file": "captures/face_share_capture.jsonl",
-  "enable_lua_hook": true,
+  "enable_lua_hook": false,
   "enable_winhttp_hook": true,
   "capture_only_filepicker": true,
   "redact_secrets": true,
