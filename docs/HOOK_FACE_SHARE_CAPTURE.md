@@ -46,6 +46,9 @@ node scripts/parse_filepicker_capture.js captures/face_share_capture.jsonl
 | `enable_lua_hook` | **true** | Pattern-scan `lua_pcallk` + inject logger |
 | `enable_winhttp_fallback` | **false** | Optional WinHTTP allowlist (15s wait, non-blocking) |
 | `enable_lua_debug_hook` | false | Reserved; never auto-enables `debug.sethook` |
+| `enable_pcall_observer_when_loader_missing` | false | Observe-only `lua_pcallk` when loader sig missing (no inject) |
+
+If `lua_load` exact match is missing, boot writes `captures/lua_signature_probe.json` and **F5 is ignored** (no crash). Offline: `LuaSignatureProbe.exe --module path\to\wwm.exe`.
 | `capture_only_filepicker` | true | Filter non-face-fp traffic (WinHTTP path) |
 | `redact_secrets` | true | Redact token/session headers |
 | `capture_full_face_data` | false | Never write full R67 by default |

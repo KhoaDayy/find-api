@@ -23,6 +23,8 @@ struct HookConfig {
   bool enable_winhttp_hook = false;
   // Never auto-enable; reserved for future optional diagnostics only.
   bool enable_lua_debug_hook = false;
+  // If lua_load missing but lua_pcallk exact: install observe-only detour (no inject).
+  bool enable_pcall_observer_when_loader_missing = false;
 
   bool capture_only_filepicker = true;
   bool redact_secrets = true;

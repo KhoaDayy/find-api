@@ -1,14 +1,15 @@
 #include "hook/lua_runtime_hook.h"
 #include "MinHook.h"
 #include "hook/capture_writer.h"
+#include "hook/lua_signature_probe.h"
+#include "hook/lua_signatures.h"
 #include "pattern_scan.h"
 #include <Windows.h>
 #include <TlHelp32.h>
 #include <cctype>
 #include <cstdarg>
 #include <cstdio>
-#include <mutex>
-#include <set>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -32,19 +33,52 @@ typedef BOOL(WINAPI *GetModuleInformation_t)(HANDLE, HMODULE, MY_MODULEINFO *, D
 
 lua_load_fn g_lua_load = nullptr;
 lua_pcallk_fn g_lua_pcallk_orig = nullptr;
+LuaLoaderKind g_loaderKind = LuaLoaderKind::None;
 
 HookConfig g_cfg;
 std::string g_dllDir;
 std::string g_scriptPath;
-std::mutex g_stateMu;
-std::set<lua_State *> g_injected;
-bool g_pendingInject = true;
-thread_local bool g_insideLuaInjection = false;
+
+// --- Atomic / fixed-capacity state (no std::mutex / std::set on hot paths) ---
+static volatile LONG g_hookState = (LONG)LuaHookState::Disabled;
+static volatile LONG g_pendingInject = 0;
+static SRWLOCK g_stateLock = SRWLOCK_INIT;
+static constexpr int kMaxInjected = 8;
+static lua_State *g_injectedStates[kMaxInjected] = {};
+static volatile LONG g_injectedCount = 0;
+static thread_local bool g_insideLuaInjection = false;
+static volatile LONG g_pcallObsCount = 0;
+static constexpr LONG kMaxPcallObs = 20;
 
 struct LoadS {
   const char *s;
   size_t size;
 };
+
+void SetHookState(LuaHookState s) { InterlockedExchange(&g_hookState, (LONG)s); }
+
+LuaHookState GetHookStateLocal() { return (LuaHookState)InterlockedCompareExchange(&g_hookState, 0, 0); }
+
+void BootPrintf(const char *fmt, ...) {
+  char buf[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  std::string logPath =
+      g_dllDir.empty() ? std::string("hook_boot.log") : (g_dllDir + "hook_boot.log");
+  FILE *f = nullptr;
+  if (fopen_s(&f, logPath.c_str(), "a") == 0 && f) {
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    fprintf(f, "[%02d:%02d:%02d.%03d] %s\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+            buf);
+    fflush(f);
+    fclose(f);
+  }
+  printf("%s\n", buf);
+  fflush(stdout);
+}
 
 const char *__cdecl lua_reader_cb(lua_State *, void *ud, size_t *sz) {
   LoadS *ls = (LoadS *)ud;
@@ -81,39 +115,47 @@ std::string HexPtr(uintptr_t p) {
   return b;
 }
 
-void BootPrintf(const char *fmt, ...) {
-  char buf[1024];
-  va_list ap;
-  va_start(ap, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, ap);
-  va_end(ap);
-  // Also append to hook_boot.log via a tiny open (no shared BootLog linkage).
-  char dir[MAX_PATH] = {};
-  GetModuleFileNameA(nullptr, dir, MAX_PATH); // process exe — fine for visibility
-  // Prefer DLL-adjacent boot log: path stored in g_dllDir when set.
-  std::string logPath =
-      g_dllDir.empty() ? std::string("hook_boot.log") : (g_dllDir + "hook_boot.log");
-  FILE *f = nullptr;
-  if (fopen_s(&f, logPath.c_str(), "a") == 0 && f) {
-    SYSTEMTIME st{};
-    GetLocalTime(&st);
-    fprintf(f, "[%02d:%02d:%02d.%03d] %s\n", st.wHour, st.wMinute, st.wSecond,
-            st.wMilliseconds, buf);
-    fflush(f);
-    fclose(f);
+bool StateAlreadyInjected(lua_State *L) {
+  AcquireSRWLockShared(&g_stateLock);
+  bool hit = false;
+  LONG n = g_injectedCount;
+  if (n > kMaxInjected)
+    n = kMaxInjected;
+  for (LONG i = 0; i < n; i++) {
+    if (g_injectedStates[i] == L) {
+      hit = true;
+      break;
+    }
   }
-  printf("%s\n", buf);
-  fflush(stdout);
+  ReleaseSRWLockShared(&g_stateLock);
+  return hit;
+}
+
+// Returns false if table full (still safe — skip inject, do not crash).
+bool TryMarkInjected(lua_State *L) {
+  AcquireSRWLockExclusive(&g_stateLock);
+  LONG n = g_injectedCount;
+  for (LONG i = 0; i < n && i < kMaxInjected; i++) {
+    if (g_injectedStates[i] == L) {
+      ReleaseSRWLockExclusive(&g_stateLock);
+      return true;
+    }
+  }
+  if (n >= kMaxInjected) {
+    ReleaseSRWLockExclusive(&g_stateLock);
+    return false;
+  }
+  g_injectedStates[n] = L;
+  InterlockedExchange(&g_injectedCount, n + 1);
+  ReleaseSRWLockExclusive(&g_stateLock);
+  return true;
 }
 
 void InjectLuaScript(lua_State *L) {
   if (!g_lua_load || !g_lua_pcallk_orig || !L)
     return;
-  {
-    std::lock_guard<std::mutex> lock(g_stateMu);
-    if (g_injected.count(L))
-      return;
-  }
+  if (StateAlreadyInjected(L))
+    return;
 
   BootPrintf("lua_State observed %p", L);
   BootPrintf("face_share_logger.lua load started");
@@ -121,8 +163,7 @@ void InjectLuaScript(lua_State *L) {
   std::string script = ReadTextFile(g_scriptPath);
   if (script.empty()) {
     WriteCaptureEvent("native", "lua_inject_error",
-                      "{\"error\":\"script_not_found\",\"path\":" + JsonString(g_scriptPath) +
-                          "}");
+                      "{\"error\":\"script_not_found\",\"path\":" + JsonString(g_scriptPath) + "}");
     BootPrintf("[!] Cannot read script: %s", g_scriptPath.c_str());
     return;
   }
@@ -150,7 +191,6 @@ void InjectLuaScript(lua_State *L) {
   BootPrintf("lua_load rc=%d", rc);
   if (rc != 0) {
     WriteCaptureEvent("native", "lua_load_failed", "{\"code\":" + std::to_string(rc) + "}");
-    // Cannot safely read Lua error string without lua_tolstring — leave code only.
     return;
   }
   rc = g_lua_pcallk_orig(L, 0, 0, 0, nullptr, nullptr);
@@ -160,25 +200,39 @@ void InjectLuaScript(lua_State *L) {
     return;
   }
 
-  {
-    std::lock_guard<std::mutex> lock(g_stateMu);
-    g_injected.insert(L);
+  if (!TryMarkInjected(L)) {
+    BootPrintf("[!] injected-state table full; script ran but not tracked");
   }
-  WriteCaptureEvent("native", "lua_injected",
-                    "{\"script\":" + JsonString(g_scriptPath) + "}");
+  SetHookState(LuaHookState::Injected);
+  WriteCaptureEvent("native", "lua_injected", "{\"script\":" + JsonString(g_scriptPath) + "}");
   BootPrintf("face_share_logger.lua injected OK L=%p", L);
 }
 
 int __cdecl Detour_lua_pcallk(lua_State *L, int nargs, int nresults, int msgh, void *ctx,
                               void *k) {
-  if (g_pendingInject && !g_insideLuaInjection && L) {
-    bool need = false;
-    {
-      std::lock_guard<std::mutex> lock(g_stateMu);
-      need = g_injected.find(L) == g_injected.end();
+  LuaHookState st = GetHookStateLocal();
+
+  // Observer-only: never inject.
+  if (st == LuaHookState::PcallObserverOnly) {
+    LONG c = InterlockedIncrement(&g_pcallObsCount);
+    if (c <= kMaxPcallObs) {
+      char data[192];
+      _snprintf_s(data, _TRUNCATE,
+                  "{\"state\":\"%p\",\"nargs\":%d,\"nresults\":%d,\"count\":%ld}", L, nargs,
+                  nresults, (long)c);
+      WriteCaptureEvent("native", "lua_pcall_observed", data);
     }
-    if (need) {
+    return g_lua_pcallk_orig(L, nargs, nresults, msgh, ctx, k);
+  }
+
+  // Inject only when installed/injected and pending arm set.
+  if ((st == LuaHookState::Installed || st == LuaHookState::Injected) &&
+      InterlockedCompareExchange(&g_pendingInject, 0, 0) != 0 && !g_insideLuaInjection && L &&
+      g_lua_load) {
+    if (!StateAlreadyInjected(L)) {
       g_insideLuaInjection = true;
+      // Clear pending after first attempt so spam does not re-enter forever on failure.
+      InterlockedExchange(&g_pendingInject, 0);
       try {
         InjectLuaScript(L);
       } catch (...) {
@@ -216,10 +270,6 @@ bool GetModuleExecRange(HMODULE h, uintptr_t &base, size_t &size) {
   base = (uintptr_t)mi.lpBaseOfDll;
   size = (size_t)mi.SizeOfImage;
   return base && size;
-}
-
-bool GetModuleExecRangeByName(const char *modName, uintptr_t &base, size_t &size) {
-  return GetModuleExecRange(GetModuleHandleA(modName), base, size);
 }
 
 std::string NarrowPath(const wchar_t *w) {
@@ -263,7 +313,6 @@ bool ContainsI(const std::string &hay, const char *needle) {
   return h.find(n) != std::string::npos;
 }
 
-// Game-dir modules only (same directory as main exe). Skip system DLLs.
 struct ScanCandidate {
   std::string name;
   std::string path;
@@ -274,13 +323,11 @@ struct ScanCandidate {
 
 std::vector<ScanCandidate> CollectGameModules(const HookConfig &cfg) {
   std::vector<ScanCandidate> out;
-
   char exePath[MAX_PATH] = {};
   GetModuleFileNameA(nullptr, exePath, MAX_PATH);
   std::string gameDir = DirOf(exePath);
   std::string exeName = BaseName(exePath);
 
-  // Always include main EXE first.
   {
     ScanCandidate c;
     c.name = exeName;
@@ -290,7 +337,6 @@ std::vector<ScanCandidate> CollectGameModules(const HookConfig &cfg) {
       out.push_back(c);
   }
 
-  // Named targets from config (if different from main).
   for (const auto &tp : cfg.target_processes) {
     if (IEquals(tp, exeName))
       continue;
@@ -307,12 +353,10 @@ std::vector<ScanCandidate> CollectGameModules(const HookConfig &cfg) {
       out.push_back(c);
   }
 
-  // Other modules loaded from the game directory with lua-ish names.
-  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
-                                         GetCurrentProcessId());
+  HANDLE snap =
+      CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
   if (snap == INVALID_HANDLE_VALUE)
     return out;
-
   MODULEENTRY32W me{};
   me.dwSize = sizeof(me);
   if (Module32FirstW(snap, &me)) {
@@ -321,10 +365,8 @@ std::vector<ScanCandidate> CollectGameModules(const HookConfig &cfg) {
       std::string name = NarrowPath(me.szModule);
       if (path.empty())
         continue;
-      // Same directory as game only.
       if (!gameDir.empty() && !IEquals(DirOf(path), gameDir))
         continue;
-      // Skip if already listed.
       bool dup = false;
       for (const auto &e : out) {
         if (e.hmod == me.hModule) {
@@ -334,7 +376,6 @@ std::vector<ScanCandidate> CollectGameModules(const HookConfig &cfg) {
       }
       if (dup)
         continue;
-      // Prefer modules that look related to script runtime.
       bool interesting = ContainsI(name, "lua") || ContainsI(name, "script") ||
                          ContainsI(name, "hexm") || ContainsI(name, "wwm") ||
                          ContainsI(name, "yysls") || ContainsI(name, "engine") ||
@@ -356,7 +397,7 @@ std::vector<ScanCandidate> CollectGameModules(const HookConfig &cfg) {
 struct SigResult {
   size_t matches = 0;
   uintptr_t selected = 0;
-  std::string status; // ok | SIGNATURE_NOT_FOUND | SIGNATURE_AMBIGUOUS
+  const char *status = "SIGNATURE_NOT_FOUND";
 };
 
 SigResult EvaluateSig(const std::vector<uintptr_t> &hits) {
@@ -370,7 +411,7 @@ SigResult EvaluateSig(const std::vector<uintptr_t> &hits) {
     r.selected = hits[0];
   } else {
     r.status = "SIGNATURE_AMBIGUOUS";
-    r.selected = 0; // never first-match when ambiguous
+    r.selected = 0;
   }
   return r;
 }
@@ -392,19 +433,58 @@ void EmitSigEvent(const char *name, uintptr_t base, const SigResult &r) {
   data += ",\"status\":" + JsonString(r.status);
   data += "}";
   WriteCaptureEvent("native", "lua_signature", data);
-  BootPrintf("sig %s matches=%zu status=%s addr=%s", name, r.matches, r.status.c_str(),
+  BootPrintf("sig %s matches=%zu status=%s addr=%s", name, r.matches, r.status,
              r.selected ? HexPtr(r.selected).c_str() : "null");
 }
 
+bool InstallPcallObserver(void *pcallAddr) {
+  MH_STATUS stCreate =
+      MH_CreateHook(pcallAddr, (LPVOID)&Detour_lua_pcallk, (LPVOID *)&g_lua_pcallk_orig);
+  if (stCreate != MH_OK) {
+    BootPrintf("[!] MH_CreateHook pcall observer failed status=%d", (int)stCreate);
+    return false;
+  }
+  MH_STATUS stEnable = MH_EnableHook(pcallAddr);
+  if (stEnable != MH_OK) {
+    BootPrintf("[!] MH_EnableHook pcall observer failed status=%d", (int)stEnable);
+    return false;
+  }
+  SetHookState(LuaHookState::PcallObserverOnly);
+  InterlockedExchange(&g_pendingInject, 0);
+  WriteCaptureEvent("native", "lua_pcall_observer_installed",
+                    "{\"inject\":false,\"max_events\":20}");
+  BootPrintf("[+] pcall observer installed (no inject)");
+  return true;
+}
+
 } // namespace
+
+LuaHookState GetLuaHookState() { return GetHookStateLocal(); }
+
+const char *GetLuaHookStateName() { return LuaHookStateName(GetHookStateLocal()); }
 
 bool InstallLuaRuntimeHook(const HookConfig &cfg, const std::string &dllDir) {
   g_cfg = cfg;
   g_dllDir = dllDir;
   g_scriptPath = ResolvePath(dllDir, cfg.lua_script);
-  g_pendingInject = true;
+  InterlockedExchange(&g_pendingInject, 0);
+  InterlockedExchange(&g_injectedCount, 0);
+  InterlockedExchange(&g_pcallObsCount, 0);
+  AcquireSRWLockExclusive(&g_stateLock);
+  memset(g_injectedStates, 0, sizeof(g_injectedStates));
+  ReleaseSRWLockExclusive(&g_stateLock);
+  g_lua_load = nullptr;
+  g_lua_pcallk_orig = nullptr;
+  g_loaderKind = LuaLoaderKind::None;
 
-  // Script resolve diagnostics.
+  if (!cfg.enable_lua_hook) {
+    SetHookState(LuaHookState::Disabled);
+    BootPrintf("[*] Lua hook disabled by config");
+    return false;
+  }
+
+  SetHookState(LuaHookState::Scanning);
+
   DWORD attr = GetFileAttributesA(g_scriptPath.c_str());
   bool exists = attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
   size_t fsize = 0;
@@ -413,77 +493,153 @@ bool InstallLuaRuntimeHook(const HookConfig &cfg, const std::string &dllDir) {
     fsize = t.size();
   }
   WriteCaptureEvent("native", "lua_script_resolved",
-                    "{\"path\":" + JsonString(g_scriptPath) +
-                        ",\"exists\":" + JsonBool(exists) +
+                    "{\"path\":" + JsonString(g_scriptPath) + ",\"exists\":" + JsonBool(exists) +
                         ",\"size\":" + std::to_string(fsize) + "}");
   BootPrintf("lua_script_resolved path=%s exists=%d size=%zu", g_scriptPath.c_str(),
              exists ? 1 : 0, fsize);
-  if (!exists) {
-    BootPrintf("[!] Lua script missing — abort install");
-    return false;
-  }
 
-  char exePath[MAX_PATH] = {};
-  GetModuleFileNameA(nullptr, exePath, MAX_PATH);
-  std::string exeName = BaseName(exePath);
+  // Fingerprint main module
+  ModuleFingerprint fp{};
+  FingerprintModule(GetModuleHandleA(nullptr), fp);
+  WriteCaptureEvent(
+      "native", "module_fingerprint",
+      std::string("{\"module\":") + JsonString(fp.module) + ",\"image_size\":" +
+          std::to_string(fp.image_size) + ",\"pe_timestamp\":" + std::to_string(fp.pe_timestamp) +
+          ",\"text_rva\":" + JsonString(HexPtr(fp.text_rva)) +
+          ",\"text_size\":" + std::to_string(fp.text_size) + ",\"file_version\":" +
+          JsonString(fp.file_version) + ",\"sha256\":" + JsonString(fp.sha256) + "}");
+  BootPrintf("module fingerprint sha256=%s size=%zu ver=%s", fp.sha256.c_str(), fp.image_size,
+             fp.file_version.c_str());
 
   auto candidates = CollectGameModules(cfg);
   if (candidates.empty()) {
-    WriteCaptureEvent("native", "lua_hook_error",
-                      "{\"error\":\"target_module_not_found\"}");
+    SetHookState(LuaHookState::SignatureMissing);
+    WriteCaptureEvent("native", "lua_hook_error", "{\"error\":\"target_module_not_found\"}");
     BootPrintf("[!] No game modules for Lua pattern scan");
     return false;
   }
 
-  // Primary scan start event (main module).
   {
     const auto &m = candidates[0];
-    WriteCaptureEvent(
-        "native", "lua_scan_start",
-        std::string("{\"pid\":") + std::to_string(GetCurrentProcessId()) +
-            ",\"exe\":" + JsonString(exeName) + ",\"module\":" + JsonString(m.name) +
-            ",\"base\":" + JsonString(HexPtr(m.base)) +
-            ",\"image_size\":" + std::to_string(m.size) + "}");
-    BootPrintf("lua_scan_start pid=%lu exe=%s module=%s base=%s size=%zu",
-               GetCurrentProcessId(), exeName.c_str(), m.name.c_str(),
-               HexPtr(m.base).c_str(), m.size);
+    WriteCaptureEvent("native", "lua_scan_start",
+                      std::string("{\"pid\":") + std::to_string(GetCurrentProcessId()) +
+                          ",\"exe\":" + JsonString(m.name) + ",\"module\":" + JsonString(m.name) +
+                          ",\"base\":" + JsonString(HexPtr(m.base)) +
+                          ",\"image_size\":" + std::to_string(m.size) + "}");
+  }
+
+  // Patterns: config override, else DB entry matching sha256, else legacy.
+  std::string sigLoad = cfg.sig_lua_load;
+  std::string sigPcall = cfg.sig_lua_pcall;
+  std::string sigLoadBuf = "";
+  for (int i = 0; i < kLuaSignatureBuildCount; i++) {
+    const auto &b = kLuaSignatureBuilds[i];
+    if (b.module_sha256 && b.module_sha256[0] && !fp.sha256.empty() &&
+        fp.sha256 == b.module_sha256) {
+      if (b.sig_lua_load && b.sig_lua_load[0])
+        sigLoad = b.sig_lua_load;
+      if (b.sig_lua_pcallk && b.sig_lua_pcallk[0])
+        sigPcall = b.sig_lua_pcallk;
+      if (b.sig_luaL_loadbufferx && b.sig_luaL_loadbufferx[0])
+        sigLoadBuf = b.sig_luaL_loadbufferx;
+      BootPrintf("signature DB match build=%s", b.id);
+      break;
+    }
   }
 
   uintptr_t chosenLoad = 0;
   uintptr_t chosenPcall = 0;
   std::string chosenModule;
+  bool anyAmbiguous = false;
+  bool sawPcall = false;
 
   for (const auto &m : candidates) {
-    auto loadHits = PatternScanAll(m.base, m.size, cfg.sig_lua_load.c_str());
-    auto pcallHits = PatternScanAll(m.base, m.size, cfg.sig_lua_pcall.c_str());
+    auto loadHits = PatternScanAll(m.base, m.size, sigLoad.c_str());
+    auto pcallHits = PatternScanAll(m.base, m.size, sigPcall.c_str());
     SigResult loadR = EvaluateSig(loadHits);
     SigResult pcallR = EvaluateSig(pcallHits);
 
-    WriteCaptureEvent(
-        "native", "lua_scan_module",
-        std::string("{\"name\":") + JsonString(m.name) + ",\"path\":" + JsonString(m.path) +
-            ",\"size\":" + std::to_string(m.size) +
-            ",\"lua_load_matches\":" + std::to_string(loadR.matches) +
-            ",\"lua_pcall_matches\":" + std::to_string(pcallR.matches) + "}");
-    BootPrintf("scan module=%s size=%zu load=%zu pcall=%zu", m.name.c_str(), m.size,
-               loadR.matches, pcallR.matches);
-
-    // Per-signature detail on the module we are considering.
+    WriteCaptureEvent("native", "lua_scan_module",
+                      std::string("{\"name\":") + JsonString(m.name) + ",\"path\":" +
+                          JsonString(m.path) + ",\"size\":" + std::to_string(m.size) +
+                          ",\"lua_load_matches\":" + std::to_string(loadR.matches) +
+                          ",\"lua_pcall_matches\":" + std::to_string(pcallR.matches) + "}");
     EmitSigEvent("lua_load", m.base, loadR);
     EmitSigEvent("lua_pcallk", m.base, pcallR);
 
-    if (loadR.status == "ok" && pcallR.status == "ok" && !chosenLoad) {
+    if (loadR.status[0] && strcmp(loadR.status, "SIGNATURE_AMBIGUOUS") == 0)
+      anyAmbiguous = true;
+    if (pcallR.status[0] && strcmp(pcallR.status, "SIGNATURE_AMBIGUOUS") == 0)
+      anyAmbiguous = true;
+    if (pcallR.selected)
+      sawPcall = true;
+
+    // Optional exact luaL_loadbufferx (never fuzzy).
+    if (!chosenLoad && !sigLoadBuf.empty()) {
+      auto lb = PatternScanAll(m.base, m.size, sigLoadBuf.c_str());
+      SigResult lbR = EvaluateSig(lb);
+      EmitSigEvent("luaL_loadbufferx", m.base, lbR);
+      if (lbR.status && strcmp(lbR.status, "ok") == 0 && pcallR.selected) {
+        // Not wired as g_lua_load yet — different ABI. Record only until explicit enable.
+        BootPrintf("luaL_loadbufferx exact at %s (not auto-enabled)",
+                   HexPtr(lbR.selected).c_str());
+      }
+    }
+
+    if (loadR.selected && pcallR.selected && !chosenLoad) {
       chosenLoad = loadR.selected;
       chosenPcall = pcallR.selected;
       chosenModule = m.name;
-      // Keep scanning remaining modules for diagnostics, but lock first exact pair.
+      g_loaderKind = LuaLoaderKind::LuaLoad;
     }
+    if (!chosenPcall && pcallR.selected)
+      chosenPcall = pcallR.selected;
+  }
+
+  // Always run diagnostic probe (fail-soft).
+  {
+    std::string probePath = ResolvePath(dllDir, cfg.capture_dir + "/lua_signature_probe.json");
+    // normalize slashes
+    for (char &ch : probePath)
+      if (ch == '/')
+        ch = '\\';
+    // ensure dir
+    char dir[MAX_PATH] = {};
+    strncpy_s(dir, probePath.c_str(), _TRUNCATE);
+    char *sl = strrchr(dir, '\\');
+    if (sl) {
+      *sl = 0;
+      CreateDirectoryA(dir, nullptr);
+    }
+    char perr[128] = {};
+    if (RunLuaSignatureProbe(cfg, dllDir, fp, chosenPcall, probePath, perr, sizeof(perr)))
+      BootPrintf("[+] signature probe written: %s (%s)", probePath.c_str(), perr);
+    else
+      BootPrintf("[!] signature probe failed: %s", perr);
   }
 
   if (!chosenLoad || !chosenPcall) {
-    BootPrintf("[!] Refusing to hook: no module with exactly 1 lua_load + 1 lua_pcallk");
+    if (anyAmbiguous)
+      SetHookState(LuaHookState::SignatureAmbiguous);
+    else
+      SetHookState(LuaHookState::SignatureMissing);
+
+    BootPrintf("[!] Refusing full Lua inject: need exact unique lua_load + lua_pcallk");
     WriteCaptureEvent("native", "lua_hook_error",
-                      "{\"error\":\"SIGNATURE_NOT_FOUND_OR_AMBIGUOUS\"}");
+                      std::string("{\"error\":\"") +
+                          (anyAmbiguous ? "SIGNATURE_AMBIGUOUS" : "SIGNATURE_NOT_FOUND") + "\"}");
+
+    // Optional pcall-only observer.
+    if (cfg.enable_pcall_observer_when_loader_missing && chosenPcall && sawPcall) {
+      if (InstallPcallObserver((void *)chosenPcall))
+        return false; // not full capture installed
+    }
+    return false;
+  }
+
+  if (!exists) {
+    SetHookState(LuaHookState::SignatureMissing);
+    BootPrintf("[!] Lua script missing — abort install");
     return false;
   }
 
@@ -497,45 +653,60 @@ bool InstallLuaRuntimeHook(const HookConfig &cfg, const std::string &dllDir) {
   MH_STATUS stCreate =
       MH_CreateHook(pcallAddr, (LPVOID)&Detour_lua_pcallk, (LPVOID *)&g_lua_pcallk_orig);
   if (stCreate != MH_OK) {
+    SetHookState(LuaHookState::CreateHookFailed);
     BootPrintf("[!] MH_CreateHook lua_pcallk failed status=%d", (int)stCreate);
     WriteCaptureEvent("native", "lua_hook_error",
-                      "{\"error\":\"MH_CreateHook\",\"status\":" +
-                          std::to_string((int)stCreate) + "}");
+                      "{\"error\":\"MH_CreateHook\",\"status\":" + std::to_string((int)stCreate) +
+                          "}");
     return false;
   }
   BootPrintf("lua_pcallk hook created");
 
   MH_STATUS stEnable = MH_EnableHook(pcallAddr);
   if (stEnable != MH_OK) {
+    SetHookState(LuaHookState::EnableHookFailed);
     BootPrintf("[!] MH_EnableHook lua_pcallk failed status=%d", (int)stEnable);
     WriteCaptureEvent("native", "lua_hook_error",
-                      "{\"error\":\"MH_EnableHook\",\"status\":" +
-                          std::to_string((int)stEnable) + "}");
+                      "{\"error\":\"MH_EnableHook\",\"status\":" + std::to_string((int)stEnable) +
+                          "}");
     return false;
   }
   BootPrintf("lua_pcallk hook enabled");
 
+  SetHookState(LuaHookState::Installed);
+  // Arm once so first pcall injects without requiring F5.
+  InterlockedExchange(&g_pendingInject, 1);
+
   WriteCaptureEvent("native", "lua_hook_installed",
-                    "{\"script\":" + JsonString(g_scriptPath) +
-                        ",\"module\":" + JsonString(chosenModule) +
-                        ",\"lua_load\":" + JsonString(HexPtr(chosenLoad)) +
+                    "{\"script\":" + JsonString(g_scriptPath) + ",\"module\":" +
+                        JsonString(chosenModule) + ",\"lua_load\":" + JsonString(HexPtr(chosenLoad)) +
                         ",\"lua_pcallk\":" + JsonString(HexPtr(chosenPcall)) + "}");
-  BootPrintf("[+] Lua runtime hook installed; will inject on next pcall");
-  BootPrintf("[*] Script: %s", g_scriptPath.c_str());
+  BootPrintf("[+] Lua runtime hook installed; inject armed for next pcall");
   return true;
 }
 
 void UninstallLuaRuntimeHook() {
-  std::lock_guard<std::mutex> lock(g_stateMu);
-  g_injected.clear();
-  g_pendingInject = false;
+  InterlockedExchange(&g_pendingInject, 0);
+  SetHookState(LuaHookState::Disabled);
+  AcquireSRWLockExclusive(&g_stateLock);
+  memset(g_injectedStates, 0, sizeof(g_injectedStates));
+  InterlockedExchange(&g_injectedCount, 0);
+  ReleaseSRWLockExclusive(&g_stateLock);
 }
 
-void RequestLuaInject() {
-  std::lock_guard<std::mutex> lock(g_stateMu);
-  g_injected.clear();
-  g_pendingInject = true;
-  BootPrintf("F5 injection armed");
+bool RequestLuaInject(char *reason, size_t reasonN) {
+  LuaHookState st = GetHookStateLocal();
+  if (!LuaHookStateAllowsF5(st)) {
+    const char *why = LuaHookStateF5RejectReason(st);
+    if (reason && reasonN)
+      _snprintf_s(reason, reasonN, _TRUNCATE, "%s", why);
+    return false;
+  }
+  // Atomic arm only — no mutex, no clear of injected states.
+  InterlockedExchange(&g_pendingInject, 1);
+  if (reason && reasonN)
+    _snprintf_s(reason, reasonN, _TRUNCATE, "armed");
+  return true;
 }
 
 } // namespace face_capture

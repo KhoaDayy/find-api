@@ -18,6 +18,7 @@
 #include "MinHook.h"
 #include "hook/capture_writer.h"
 #include "hook/config.h"
+#include "hook/lua_hook_state.h"
 #include "hook/lua_runtime_hook.h"
 #include "hook/winhttp_capture.h"
 
@@ -249,22 +250,34 @@ static int Step_Lua() {
   if (InstallLuaRuntimeHook(g_cfg, g_dllDir))
     ConPrint("[+] Lua runtime hook installed (injects on next pcall / F5)");
   else
-    ConPrint("[!] Lua hook failed (see signature scan events in JSONL / boot log)");
+    ConPrint("[!] Lua full inject unavailable state=%s (probe/scan in captures/)",
+             GetLuaHookStateName());
   return 0;
 }
 
 static int Step_WriteInitComplete() {
-  WriteCaptureEvent("native", "init_complete",
-                    std::string("{\"ok\":true,\"lua\":") +
-                        (g_cfg.enable_lua_hook ? "true" : "false") +
-                        ",\"winhttp_fallback\":" +
-                        (g_cfg.enable_winhttp_fallback ? "true" : "false") + "}");
+  LuaHookState st = GetLuaHookState();
+  const char *name = LuaHookStateName(st);
+  bool installed = st == LuaHookState::Installed || st == LuaHookState::Injected;
+  WriteCaptureEvent(
+      "native", "init_complete",
+      std::string("{\"ok\":true,\"lua_requested\":") +
+          (g_cfg.enable_lua_hook ? "true" : "false") +
+          ",\"lua_hook_state\":" + JsonString(name) +
+          ",\"lua_hook_installed\":" + (installed ? "true" : "false") +
+          ",\"winhttp_fallback\":" +
+          (g_cfg.enable_winhttp_fallback ? "true" : "false") + "}");
   return 0;
 }
 
+// No C++ std objects with destructors — SEH-safe.
 static int Step_RequestLua() {
-  ConPrint("F5 injection armed");
-  RequestLuaInject();
+  char reason[160] = {};
+  if (RequestLuaInject(reason, sizeof(reason))) {
+    ConPrint("F5 injection armed");
+  } else {
+    ConPrint("F5 ignored: %s", reason[0] ? reason : "LUA_HOOK_NOT_INSTALLED");
+  }
   return 0;
 }
 
@@ -333,11 +346,27 @@ static DWORD WINAPI InitThread(LPVOID) {
 
   RunStep("write_init_complete", Step_WriteInitComplete);
 
-  ConPrint("[*] Init complete. Use Face Share in-game (F5 re-arms Lua inject).");
+  {
+    LuaHookState st = GetLuaHookState();
+    if (st == LuaHookState::Installed || st == LuaHookState::Injected)
+      ConPrint("[*] Init complete: Lua hook installed. Press F5 to arm injection.");
+    else if (st == LuaHookState::SignatureMissing)
+      ConPrint("[*] Init complete: Lua capture unavailable — lua_load signature missing. "
+               "Do not press F5. See captures/lua_signature_probe.json");
+    else if (st == LuaHookState::SignatureAmbiguous)
+      ConPrint("[*] Init complete: Lua capture unavailable — signature ambiguous.");
+    else if (st == LuaHookState::PcallObserverOnly)
+      ConPrint("[*] Init complete: pcall observer only (no inject). F5 ignored.");
+    else if (st == LuaHookState::Disabled)
+      ConPrint("[*] Init complete: Lua hook disabled.");
+    else
+      ConPrint("[*] Init complete: lua_hook_state=%s", LuaHookStateName(st));
+  }
 
   while (InterlockedCompareExchange(&g_running, 1, 1) == 1) {
     if (GetAsyncKeyState(VK_F5) & 1) {
-      ConPrint("[*] F5: re-inject Lua");
+      // Direct call — RequestLuaInject is atomic and must not AV.
+      // Still wrap in SEH for defense in depth.
       RunStep("request_lua", Step_RequestLua);
     }
     Sleep(100);

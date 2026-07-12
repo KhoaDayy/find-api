@@ -151,16 +151,18 @@ test('no full R67 in sanitized capture-like object', () => {
 });
 
 test('session.txt is not part of default hook config', () => {
-  const cfg = fs.readFileSync(path.join(__dirname, '..', 'hook_config.json'), 'utf8');
+  const cfg = fs.readFileSync(path.join(__dirname, '..', 'hook_config.example.json'), 'utf8');
   const j = JSON.parse(cfg);
   assert.strictEqual(j.unsafe_save_session, false);
   assert.ok(j.lua_script.includes('face_share_logger'));
-  assert.ok(j.output_file.includes('face_share_capture'));
+  assert.strictEqual(j.capture_dir, 'captures');
+  assert.strictEqual(j.enable_lua_hook, true);
+  assert.strictEqual(j.enable_winhttp_fallback, false);
 });
 
 test('legacy api_logger is not the default script', () => {
   const cfg = JSON.parse(
-    fs.readFileSync(path.join(__dirname, '..', 'hook_config.json'), 'utf8')
+    fs.readFileSync(path.join(__dirname, '..', 'hook_config.example.json'), 'utf8')
   );
   assert.ok(!cfg.lua_script.includes('api_logger.lua'));
 });

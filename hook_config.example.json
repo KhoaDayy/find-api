@@ -7,6 +7,7 @@
   "enable_lua_hook": true,
   "enable_winhttp_fallback": false,
   "enable_lua_debug_hook": false,
+  "enable_pcall_observer_when_loader_missing": false,
   "lua_script": "Scripts/face_share_logger.lua",
   "capture_dir": "captures",
   "capture_only_filepicker": true,

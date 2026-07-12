@@ -52,7 +52,7 @@ if errorlevel 1 (
 echo [*] Compiler: MSVC
 echo.
 
-echo [1/2] GameHook.dll ...
+echo [1/3] GameHook.dll ...
 cl /nologo /LD /O2 /EHsc /MD /std:c++17 /DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE ^
   /I"lib\minhook\include" /I"src" ^
   src\dllmain.cpp ^
@@ -61,20 +61,32 @@ cl /nologo /LD /O2 /EHsc /MD /std:c++17 /DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE 
   src\hook\redact.cpp ^
   src\hook\winhttp_capture.cpp ^
   src\hook\lua_runtime_hook.cpp ^
+  src\hook\lua_signature_probe.cpp ^
   lib\minhook\src\buffer.c ^
   lib\minhook\src\hook.c ^
   lib\minhook\src\trampoline.c ^
   lib\minhook\src\hde\hde64.c ^
   /Fo"build\obj\\" ^
   /Fe:"build\bin\GameHook.dll" ^
-  /link /DLL user32.lib winhttp.lib psapi.lib advapi32.lib
+  /link /DLL user32.lib winhttp.lib psapi.lib advapi32.lib bcrypt.lib version.lib
 if errorlevel 1 goto :fail
 
-echo [2/2] Injector.exe ...
+echo [2/3] Injector.exe ...
 cl /nologo /O2 /EHsc /MD /std:c++17 /DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE ^
   src\injector.cpp ^
   /Fo"build\obj\\" ^
   /Fe:"build\bin\Injector.exe"
+if errorlevel 1 goto :fail
+
+echo [3/3] LuaSignatureProbe.exe ...
+cl /nologo /O2 /EHsc /MD /std:c++17 /DWIN32 /D_WINDOWS ^
+  /I"src" ^
+  src\lua_signature_probe_main.cpp ^
+  src\hook\config.cpp ^
+  src\hook\lua_signature_probe.cpp ^
+  /Fo"build\obj\\" ^
+  /Fe:"build\bin\LuaSignatureProbe.exe" ^
+  /link bcrypt.lib version.lib psapi.lib
 if errorlevel 1 goto :fail
 
 copy /Y "Scripts\face_share_logger.lua" "build\bin\Scripts\" >nul
@@ -90,11 +102,14 @@ goto :ok
 echo [*] Compiler: MinGW g++
 g++ -shared -O2 -std=c++17 -I"lib/minhook/include" -I"src" ^
   src/dllmain.cpp src/hook/config.cpp src/hook/capture_writer.cpp src/hook/redact.cpp ^
-  src/hook/winhttp_capture.cpp src/hook/lua_runtime_hook.cpp ^
+  src/hook/winhttp_capture.cpp src/hook/lua_runtime_hook.cpp src/hook/lua_signature_probe.cpp ^
   lib/minhook/src/buffer.c lib/minhook/src/hook.c lib/minhook/src/trampoline.c lib/minhook/src/hde/hde64.c ^
-  -luser32 -lwinhttp -lpsapi -static -o build/bin/GameHook.dll
+  -luser32 -lwinhttp -lpsapi -lbcrypt -lversion -static -o build/bin/GameHook.dll
 if errorlevel 1 goto :fail
 g++ -O2 -std=c++17 src/injector.cpp -static -o build/bin/Injector.exe
+if errorlevel 1 goto :fail
+g++ -O2 -std=c++17 -I"src" src/lua_signature_probe_main.cpp src/hook/config.cpp src/hook/lua_signature_probe.cpp ^
+  -lbcrypt -lversion -lpsapi -static -o build/bin/LuaSignatureProbe.exe
 if errorlevel 1 goto :fail
 copy /Y Scripts\face_share_logger.lua build\bin\Scripts\ >nul
 if exist hook_config.example.json (
@@ -106,6 +121,7 @@ goto :ok
 :ok
 if not exist "build\bin\GameHook.dll" goto :fail
 if not exist "build\bin\Injector.exe" goto :fail
+if not exist "build\bin\LuaSignatureProbe.exe" goto :fail
 if not exist "build\bin\Scripts\face_share_logger.lua" goto :fail
 if not exist "build\bin\hook_config.json" if not exist "build\bin\hook_config.example.json" goto :fail
 
@@ -114,6 +130,7 @@ echo ============================================
 echo   BUILD OK
 echo   build\bin\GameHook.dll
 echo   build\bin\Injector.exe
+echo   build\bin\LuaSignatureProbe.exe
 echo   build\bin\Scripts\face_share_logger.lua
 echo   build\bin\hook_config.json  (lua_hook ON, winhttp_fallback OFF)
 echo ============================================

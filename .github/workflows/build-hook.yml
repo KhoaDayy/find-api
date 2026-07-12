@@ -8,6 +8,7 @@ on:
       - "src/hook/**"
       - "src/dllmain.cpp"
       - "src/injector.cpp"
+      - "src/lua_signature_probe_main.cpp"
       - "src/pattern_scan.h"
       - "lib/minhook/**"
       - "Scripts/face_share_logger.lua"
@@ -91,13 +92,16 @@ jobs:
 
           $dll = Get-ChildItem $bin -Recurse -Filter "GameHook.dll" | Select-Object -First 1
           $injector = Get-ChildItem $bin -Recurse -Filter "Injector.exe" | Select-Object -First 1
+          $probe = Get-ChildItem $bin -Recurse -Filter "LuaSignatureProbe.exe" | Select-Object -First 1
           $lua = Get-ChildItem $bin -Recurse -Filter "face_share_logger.lua" | Select-Object -First 1
           if (-not $dll) { throw "GameHook.dll not found" }
           if (-not $injector) { throw "Injector.exe not found" }
+          if (-not $probe) { throw "LuaSignatureProbe.exe not found" }
           if (-not $lua) { throw "face_share_logger.lua not found" }
 
           Write-Host "DLL: $($dll.FullName) — $($dll.Length) bytes"
           Write-Host "Injector: $($injector.FullName) — $($injector.Length) bytes"
+          Write-Host "Probe: $($probe.FullName) — $($probe.Length) bytes"
           Write-Host "Lua: $($lua.FullName) — $($lua.Length) bytes"
           Get-ChildItem $bin -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
 
@@ -135,19 +139,21 @@ jobs:
 
           $title = "Face Share Hook $short"
           $notes = @"
-          PassivePassive face FilePicker share capture** (x64 Windows)
+          **Passive face FilePicker share capture** (x64 Windows) — Lua-first
 
           - Commit: ``$sha``
-          - Contents: ``GameHook.dll``, ``Injector.exe``, ``Scripts/face_share_logger.lua``, ``hook_config.json``
+          - Contents: ``GameHook.dll``, ``Injector.exe``, ``LuaSignatureProbe.exe``, ``Scripts/face_share_logger.lua``, ``hook_config.json``
           - Capture only — no live upload / token replay
+          - If lua_load signature missing: F5 is ignored; see ``captures/lua_signature_probe.json``
 
           ## Usage
           1. Unzip next to each other
-          2. Start game (``yysls.exe`` / ``wwm.exe``)
-          3. Run ``Injector.exe`` as Administrator
-          4. Press F5 in the hook console if needed
+          2. Start game (``wwm.exe`` / ``yysls.exe``)
+          3. Run ``Injector.exe --pid <pid>`` as Administrator
+          4. Check ``hook_boot.log`` — F5 only if Lua hook installed
           5. In-game: Face Share once
-          6. Parse: ``node scripts/parse_filepicker_capture.js captures/face_share_capture.jsonl``
+          6. Parse: ``node Scripts/parse_filepicker_capture.js captures/face_share_capture.jsonl``
+          7. Offline probe: ``LuaSignatureProbe.exe --module path\to\wwm.exe``
 
           See ``docs/HOOK_FACE_SHARE_CAPTURE.md``.
           "@
