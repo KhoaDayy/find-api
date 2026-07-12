@@ -132,7 +132,7 @@ Injected logger for the Face Share → FilePicker path. **Observe only** — no 
 2. Download the latest `wwm-face-share-hook-*.zip` / artifact
 3. Unzip so `GameHook.dll`, `Injector.exe`, `Scripts/`, and config sit together
 4. Start the game (`yysls.exe` / `wwm.exe` per config)
-5. Run `Injector.exe` as Administrator → F5 in the console if needed
+5. Run `Injector.exe` as Administrator (or `Injector.exe --pid <pid>`) → F5 re-arms Lua inject
 6. Trigger **Face Share** once in-game
 7. Parse:
 
@@ -179,7 +179,7 @@ UI: `index.html`.
 
 ```
 src/wwm/           Face inventory, cache, resolve API
-src/hook/          C++ capture modules (WinHTTP + Lua inject)
+src/hook/          C++ capture (Lua-first inject; optional WinHTTP fallback)
 src/storage/       SQLite face cache
 src/parsers/       Short-code / long-face parsers
 Scripts/           face_share_logger.lua + JS diagnostics

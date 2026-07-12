@@ -2,6 +2,10 @@
  * GameHook.dll — passive Face FilePicker share capture only.
  * Boot is deferred and fail-soft so a bad step does not take down the game.
  *
+ * Boot order (Lua-first):
+ *   config → capture dir/JSONL → MH_Initialize → Lua signatures/hook
+ *   → optional WinHTTP background wait (only if enable_winhttp_fallback)
+ *
  * MSVC rule: never put __try in a function that constructs C++ objects
  * with destructors (error C2712). SEH lives only in pure C wrappers.
  */
@@ -22,6 +26,7 @@ using namespace face_capture;
 static HMODULE g_hSelf = nullptr;
 static HookConfig g_cfg;
 static std::string g_dllDir;
+static std::string g_capturePath;
 static HANDLE g_initThread = nullptr;
 static volatile LONG g_running = 1;
 static bool g_consoleReady = false;
@@ -105,19 +110,77 @@ static int Step_LoadConfig() {
   return 0;
 }
 
-static int Step_InitCapture() {
-  char out[MAX_PATH] = {};
-  if (!g_cfg.output_file.empty() &&
-      (g_cfg.output_file[0] == '\\' || g_cfg.output_file[0] == '/' ||
-       (g_cfg.output_file.size() > 1 && g_cfg.output_file[1] == ':'))) {
-    _snprintf_s(out, _TRUNCATE, "%s", g_cfg.output_file.c_str());
-  } else {
-    _snprintf_s(out, _TRUNCATE, "%s%s", g_dllDir.c_str(),
-                g_cfg.output_file.empty() ? "captures\\face_share_capture.jsonl"
-                                          : g_cfg.output_file.c_str());
+static bool EnsureDirectoryTree(const char *dirPath) {
+  if (!dirPath || !*dirPath)
+    return false;
+  char buf[MAX_PATH] = {};
+  strncpy_s(buf, dirPath, _TRUNCATE);
+  size_t n = strlen(buf);
+  while (n > 0 && (buf[n - 1] == '\\' || buf[n - 1] == '/')) {
+    buf[--n] = '\0';
   }
-  InitCaptureWriter(std::string(out));
-  ConPrint("Capture: %s", out);
+  for (char *p = buf; *p; ++p) {
+    if (*p == '\\' || *p == '/') {
+      char save = *p;
+      *p = '\0';
+      if (buf[0] && !(buf[1] == ':' && buf[2] == '\0')) {
+        if (!CreateDirectoryA(buf, nullptr)) {
+          DWORD e = GetLastError();
+          if (e != ERROR_ALREADY_EXISTS)
+            return false;
+        }
+      }
+      *p = save;
+    }
+  }
+  if (buf[0] && !(buf[1] == ':' && buf[2] == '\0')) {
+    if (!CreateDirectoryA(buf, nullptr)) {
+      DWORD e = GetLastError();
+      if (e != ERROR_ALREADY_EXISTS)
+        return false;
+    }
+  }
+  return true;
+}
+
+static int Step_InitCapture() {
+  g_capturePath = ResolveCaptureOutputPath(g_dllDir, g_cfg);
+
+  // Parent directory for JSONL.
+  char dir[MAX_PATH] = {};
+  strncpy_s(dir, g_capturePath.c_str(), _TRUNCATE);
+  char *slash = strrchr(dir, '\\');
+  if (!slash)
+    slash = strrchr(dir, '/');
+  if (slash)
+    *slash = '\0';
+
+  if (!EnsureDirectoryTree(dir)) {
+    DWORD e = GetLastError();
+    ConPrint("[!] create capture dir failed path=%s err=%lu — fallback DLL/captures",
+             dir, e);
+    g_capturePath = g_dllDir + "captures\\face_share_capture.jsonl";
+    std::string fb = g_dllDir + "captures";
+    if (!EnsureDirectoryTree(fb.c_str())) {
+      ConPrint("[!] fallback capture dir also failed err=%lu", GetLastError());
+    } else {
+      ConPrint("[+] fallback capture dir: %s", fb.c_str());
+    }
+  } else {
+    ConPrint("[+] capture dir ready: %s", dir);
+  }
+
+  InitCaptureWriter(g_capturePath);
+  ConPrint("Capture JSONL: %s", g_capturePath.c_str());
+
+  // Verify file can be opened by re-checking attributes after InitCaptureWriter.
+  DWORD attr = GetFileAttributesA(g_capturePath.c_str());
+  if (attr == INVALID_FILE_ATTRIBUTES) {
+    // File may not exist until first write; check parent only.
+    ConPrint("[*] capture file not yet on disk (writer will create on first event)");
+  } else {
+    ConPrint("[+] capture file exists");
+  }
   return 0;
 }
 
@@ -127,14 +190,14 @@ static int Step_MinHook() {
     ConPrint("[!] MinHook init failed status=%d", (int)st);
     return 1;
   }
-  ConPrint("[+] MinHook ready");
+  ConPrint("[+] MinHook initialized");
   return 0;
 }
 
-// Polls in a side thread so InitThread stays responsive (F5 etc.).
+// Short optional wait — never blocks Lua. Max 15s per requirements.
 static DWORD WINAPI WinHttpWaitThread(LPVOID) {
   char reason[128] = {};
-  const int maxTries = 120; // ~2 min
+  const int maxTries = 15;
   for (int i = 0; i < maxTries && InterlockedCompareExchange(&g_running, 1, 1) == 1;
        i++) {
     if (GetModuleHandleA("winhttp.dll")) {
@@ -145,21 +208,21 @@ static DWORD WINAPI WinHttpWaitThread(LPVOID) {
       }
       return 0;
     }
-    if (i == 0 || (i + 1) % 15 == 0)
+    if (i == 0 || (i + 1) % 5 == 0)
       ConPrint("[*] waiting for winhttp.dll ... %ds", i);
     Sleep(1000);
   }
   if (InterlockedCompareExchange(&g_running, 1, 1) == 1)
-    ConPrint("[!] WinHTTP capture skipped: winhttp.dll never loaded");
+    ConPrint("WINHTTP_NOT_LOADED");
   return 0;
 }
 
 static int Step_WinHttp() {
-  if (!g_cfg.enable_winhttp_hook) {
-    ConPrint("[*] WinHTTP capture disabled by config");
+  // Prefer new flag; enable_winhttp_hook is kept in sync by LoadConfig.
+  if (!g_cfg.enable_winhttp_fallback && !g_cfg.enable_winhttp_hook) {
+    ConPrint("WINHTTP_FALLBACK_DISABLED");
     return 0;
   }
-  // Fast path if already mapped.
   if (GetModuleHandleA("winhttp.dll")) {
     char reason[128] = {};
     if (InstallWinHttpCapture(g_cfg, reason, sizeof(reason))) {
@@ -169,7 +232,7 @@ static int Step_WinHttp() {
     ConPrint("[!] WinHTTP install failed: %s", reason);
     return 0;
   }
-  ConPrint("[*] winhttp.dll not loaded yet — background wait started");
+  ConPrint("[*] winhttp.dll not loaded yet — background wait (15s, non-blocking)");
   HANDLE h = CreateThread(nullptr, 0, WinHttpWaitThread, nullptr, 0, nullptr);
   if (h)
     CloseHandle(h);
@@ -180,22 +243,27 @@ static int Step_WinHttp() {
 
 static int Step_Lua() {
   if (!g_cfg.enable_lua_hook) {
-    ConPrint("[*] Lua hook disabled by config (safer default)");
+    ConPrint("[*] Lua hook disabled by config");
     return 0;
   }
   if (InstallLuaRuntimeHook(g_cfg, g_dllDir))
-    ConPrint("[+] Lua runtime hook installed (injects on next pcall)");
+    ConPrint("[+] Lua runtime hook installed (injects on next pcall / F5)");
   else
-    ConPrint("[!] Lua hook failed (signatures/module). WinHTTP may still work.");
+    ConPrint("[!] Lua hook failed (see signature scan events in JSONL / boot log)");
   return 0;
 }
 
 static int Step_WriteInitComplete() {
-  WriteCaptureEvent("native", "init_complete", "{\"ok\":true}");
+  WriteCaptureEvent("native", "init_complete",
+                    std::string("{\"ok\":true,\"lua\":") +
+                        (g_cfg.enable_lua_hook ? "true" : "false") +
+                        ",\"winhttp_fallback\":" +
+                        (g_cfg.enable_winhttp_fallback ? "true" : "false") + "}");
   return 0;
 }
 
 static int Step_RequestLua() {
+  ConPrint("F5 injection armed");
   RequestLuaInject();
   return 0;
 }
@@ -236,7 +304,7 @@ static DWORD WINAPI InitThread(LPVOID) {
 
   ConPrint("========================================");
   ConPrint("  Face FilePicker Share Capture");
-  ConPrint("  Passive only — no request mutation");
+  ConPrint("  Passive only — Lua-first, no mutation");
   ConPrint("========================================");
 
   if (RunStep("load_config", Step_LoadConfig) < 0) {
@@ -244,27 +312,28 @@ static DWORD WINAPI InitThread(LPVOID) {
     return 1;
   }
   ConPrint("DLL dir: %s", g_dllDir.c_str());
-  ConPrint("Config: lua_hook=%d winhttp=%d script=%s",
-           g_cfg.enable_lua_hook ? 1 : 0, g_cfg.enable_winhttp_hook ? 1 : 0,
-           g_cfg.lua_script.c_str());
+  ConPrint("Config: lua_hook=%d winhttp_fallback=%d script=%s capture_dir=%s",
+           g_cfg.enable_lua_hook ? 1 : 0, g_cfg.enable_winhttp_fallback ? 1 : 0,
+           g_cfg.lua_script.c_str(), g_cfg.capture_dir.c_str());
   ConPrint("Boot log: %shook_boot.log", g_dllDir.c_str());
   ConPrint("========================================");
 
-  // Hooks before capture I/O — previous AV was right after Config.
+  // Capture I/O first so signature diagnostics always have a JSONL sink.
+  if (RunStep("init_capture", Step_InitCapture) < 0)
+    ConPrint("[!] Capture writer step failed — continuing (boot log only)");
+
   if (RunStep("minhook", Step_MinHook) != 0) {
     ConPrint("[!] Abort: MinHook unavailable");
     return 1;
   }
 
-  RunStep("winhttp", Step_WinHttp);
+  // Lua BEFORE optional WinHTTP — never blocked by winhttp wait.
   RunStep("lua", Step_Lua);
+  RunStep("winhttp", Step_WinHttp);
 
-  if (RunStep("init_capture", Step_InitCapture) < 0)
-    ConPrint("[!] Capture writer crashed (non-fatal) — hooks already installed");
-  else
-    RunStep("write_init_complete", Step_WriteInitComplete);
+  RunStep("write_init_complete", Step_WriteInitComplete);
 
-  ConPrint("[*] Init complete. Use Face Share in-game.");
+  ConPrint("[*] Init complete. Use Face Share in-game (F5 re-arms Lua inject).");
 
   while (InterlockedCompareExchange(&g_running, 1, 1) == 1) {
     if (GetAsyncKeyState(VK_F5) & 1) {

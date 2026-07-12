@@ -78,11 +78,11 @@ cl /nologo /O2 /EHsc /MD /std:c++17 /DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE ^
 if errorlevel 1 goto :fail
 
 copy /Y "Scripts\face_share_logger.lua" "build\bin\Scripts\" >nul
-rem Always ship safe defaults (lua_hook OFF). Never overwrite with a local
-rem debug config that may re-enable pattern hooks and crash the game.
+rem Ship example defaults (Lua-first, winhttp_fallback OFF). Always refresh
+rem example; only seed hook_config.json when missing so local overrides stick.
 if exist "hook_config.example.json" (
   copy /Y "hook_config.example.json" "build\bin\hook_config.example.json" >nul
-  copy /Y "hook_config.example.json" "build\bin\hook_config.json" >nul
+  if not exist "build\bin\hook_config.json" copy /Y "hook_config.example.json" "build\bin\hook_config.json" >nul
 )
 goto :ok
 
@@ -115,7 +115,7 @@ echo   BUILD OK
 echo   build\bin\GameHook.dll
 echo   build\bin\Injector.exe
 echo   build\bin\Scripts\face_share_logger.lua
-echo   build\bin\hook_config.json  (lua_hook OFF by default)
+echo   build\bin\hook_config.json  (lua_hook ON, winhttp_fallback OFF)
 echo ============================================
 echo.
 echo IMPORTANT: do NOT use the old hook\GameHook.dll (Mar build).
@@ -124,12 +124,13 @@ echo.
 echo Usage:
 echo   1. Start game fully into world
 echo   2. Run build\bin\Injector.exe as Admin
+echo      or: Injector.exe --pid 20716
 echo   3. Check build\bin\hook_boot.log  (no console by default)
-echo   4. In-game Face Share once
+echo   4. In-game Face Share once (F5 re-arms Lua inject)
 echo   5. captures in build\bin\captures\
 echo.
 echo Optional: set GAMEHOOK_CONSOLE=1 before inject for AllocConsole.
-echo Lua pattern hook stays OFF unless you edit hook_config.json.
+echo WinHTTP fallback stays OFF unless enable_winhttp_fallback=true.
 echo.
 exit /b 0
 

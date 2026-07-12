@@ -1,6 +1,10 @@
 /*
- *  Injector.cpp  –  Injects GameHook.dll into wwm.exe
- *  No TlHelp32.h dependency (uses runtime-loaded functions)
+ *  Injector.cpp  –  Injects GameHook.dll into the game process.
+ *  Supports:
+ *    Injector.exe
+ *    Injector.exe wwm.exe
+ *    Injector.exe --pid 20716
+ *  No TlHelp32.h dependency for process enum (uses runtime-loaded functions)
  */
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -63,9 +67,15 @@ static DWORD FindPid(const wchar_t *name) {
   return pid;
 }
 
-/* Read target_process from hook_config.json next to injector (ASCII only). */
-static void LoadTargetProcess(wchar_t *out, size_t outCount) {
-  wcscpy_s(out, outCount, L"yysls.exe");
+/* Defaults + optional target_process / target_processes from hook_config.json */
+static void LoadTargetList(wchar_t names[][128], int *count, int maxCount) {
+  *count = 0;
+  const wchar_t *defaults[] = {L"wwm.exe", L"yysls.exe", L"WhereWindsMeet.exe"};
+  for (int i = 0; i < 3 && *count < maxCount; i++) {
+    wcscpy_s(names[*count], 128, defaults[i]);
+    (*count)++;
+  }
+
   wchar_t cfgPath[MAX_PATH];
   GetModuleFileNameW(NULL, cfgPath, MAX_PATH);
   wchar_t *sl = wcsrchr(cfgPath, L'\\');
@@ -77,14 +87,47 @@ static void LoadTargetProcess(wchar_t *out, size_t outCount) {
   FILE *f = nullptr;
   if (_wfopen_s(&f, cfgPath, L"rb") != 0 || !f)
     return;
-  char buf[4096] = {0};
+  char buf[8192] = {0};
   size_t n = fread(buf, 1, sizeof(buf) - 1, f);
   fclose(f);
   if (!n)
     return;
   buf[n] = 0;
+
+  // Prefer target_processes array
+  const char *keyArr = "\"target_processes\"";
+  char *p = strstr(buf, keyArr);
+  if (p) {
+    char *lb = strchr(p, '[');
+    char *rb = lb ? strchr(lb, ']') : nullptr;
+    if (lb && rb) {
+      int c = 0;
+      char *i = lb + 1;
+      while (i < rb && c < maxCount) {
+        char *q1 = strchr(i, '"');
+        if (!q1 || q1 >= rb)
+          break;
+        char *q2 = strchr(q1 + 1, '"');
+        if (!q2 || q2 > rb)
+          break;
+        char narrow[128] = {0};
+        size_t len = (size_t)(q2 - q1 - 1);
+        if (len >= sizeof(narrow))
+          len = sizeof(narrow) - 1;
+        memcpy(narrow, q1 + 1, len);
+        MultiByteToWideChar(CP_UTF8, 0, narrow, -1, names[c], 128);
+        c++;
+        i = q2 + 1;
+      }
+      if (c > 0)
+        *count = c;
+      return;
+    }
+  }
+
+  // Legacy single target_process
   const char *key = "\"target_process\"";
-  char *p = strstr(buf, key);
+  p = strstr(buf, key);
   if (!p)
     return;
   p = strchr(p + strlen(key), '"');
@@ -96,17 +139,82 @@ static void LoadTargetProcess(wchar_t *out, size_t outCount) {
     return;
   char narrow[128] = {0};
   memcpy(narrow, p, (size_t)(e - p));
-  MultiByteToWideChar(CP_UTF8, 0, narrow, -1, out, (int)outCount);
+  MultiByteToWideChar(CP_UTF8, 0, narrow, -1, names[0], 128);
+  *count = 1;
+}
+
+static int DoInject(DWORD pid, const wchar_t *dllPath) {
+  printf("[+] PID = %lu\n", pid);
+
+  HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+  if (!hProc) {
+    printf("[!] OpenProcess failed (err %lu). Run as Admin.\n", GetLastError());
+    return 1;
+  }
+
+  size_t cb = (wcslen(dllPath) + 1) * sizeof(wchar_t);
+  LPVOID pRemote =
+      VirtualAllocEx(hProc, NULL, cb, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if (!pRemote || !WriteProcessMemory(hProc, pRemote, dllPath, cb, NULL)) {
+    printf("[!] Memory allocation / write failed\n");
+    CloseHandle(hProc);
+    return 1;
+  }
+
+  FARPROC pLoadLib =
+      GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
+  HANDLE hThread = CreateRemoteThread(
+      hProc, NULL, 0, (LPTHREAD_START_ROUTINE)pLoadLib, pRemote, 0, NULL);
+
+  if (!hThread) {
+    printf("[!] CreateRemoteThread failed (err %lu). Anti-cheat?\n",
+           GetLastError());
+    VirtualFreeEx(hProc, pRemote, 0, MEM_RELEASE);
+    CloseHandle(hProc);
+    return 1;
+  }
+
+  printf("[*] Waiting for LoadLibraryW remote thread...\n");
+  DWORD wait = WaitForSingleObject(hThread, 15000);
+  if (wait != WAIT_OBJECT_0) {
+    printf("[!] Remote thread wait failed/timeout (wait=%lu err=%lu)\n", wait,
+           GetLastError());
+  }
+
+  DWORD remoteExit = 0;
+  if (!GetExitCodeThread(hThread, &remoteExit)) {
+    printf("[!] GetExitCodeThread failed (err %lu)\n", GetLastError());
+  } else {
+    printf("[*] LoadLibraryW exit code = 0x%08lX\n", remoteExit);
+    if (remoteExit == 0) {
+      printf("[!] LoadLibraryW returned NULL — DLL failed to load in the game.\n");
+      printf("    Common causes:\n");
+      printf("    - GameHook.dll not next to Injector.exe\n");
+      printf("    - Missing runtime (VS Redistributable x64)\n");
+      printf("    - Anti-cheat blocked LoadLibrary\n");
+      printf("    - Wrong arch (must be x64)\n");
+    } else {
+      printf("[+] DLL module handle looks non-null (inject call succeeded).\n");
+      printf("    Check hook_boot.log next to GameHook.dll.\n");
+    }
+  }
+
+  DWORD procCode = STILL_ACTIVE;
+  if (GetExitCodeProcess(hProc, &procCode) && procCode != STILL_ACTIVE) {
+    printf("[!] Game process exited during inject (code=%lu).\n", procCode);
+  } else {
+    printf("[+] Game process still running.\n");
+  }
+
+  CloseHandle(hThread);
+  VirtualFreeEx(hProc, pRemote, 0, MEM_RELEASE);
+  CloseHandle(hProc);
+  return 0;
 }
 
 int wmain(int argc, wchar_t **argv) {
-  wchar_t target[128];
-  LoadTargetProcess(target, 128);
-  if (argc >= 2 && argv[1] && argv[1][0])
-    wcscpy_s(target, argv[1]);
-
   printf("=== Face Share Capture Injector ===\n");
-  wprintf(L"Target: %s\n\n", target);
+  printf("Usage: Injector.exe [--pid N] [process.exe]\n\n");
 
   if (!InitToolhelp()) {
     printf("[!] Failed to load Toolhelp functions\n");
@@ -114,7 +222,6 @@ int wmain(int argc, wchar_t **argv) {
     return 1;
   }
 
-  /* --- resolve DLL path (same dir as injector) --- */
   wchar_t dllPath[MAX_PATH];
   GetModuleFileNameW(NULL, dllPath, MAX_PATH);
   wchar_t *sl = wcsrchr(dllPath, L'\\');
@@ -131,104 +238,51 @@ int wmain(int argc, wchar_t **argv) {
     return 1;
   }
 
-  /* --- find process --- */
-  wprintf(L"[*] Looking for %s ...\n", target);
-  DWORD pid = FindPid(target);
-  if (!pid) {
-    /* also try alternate common names */
-    if (_wcsicmp(target, L"yysls.exe") == 0)
-      pid = FindPid(L"wwm.exe");
-    else if (_wcsicmp(target, L"wwm.exe") == 0)
-      pid = FindPid(L"yysls.exe");
-  }
-  if (!pid) {
-    printf("[*] Waiting for game to start ...\n");
-    while (!pid) {
-      pid = FindPid(target);
-      if (!pid && _wcsicmp(target, L"yysls.exe") == 0)
-        pid = FindPid(L"wwm.exe");
-      if (!pid && _wcsicmp(target, L"wwm.exe") == 0)
-        pid = FindPid(L"yysls.exe");
-      Sleep(1000);
+  DWORD pid = 0;
+  wchar_t targets[8][128];
+  int targetCount = 0;
+  LoadTargetList(targets, &targetCount, 8);
+
+  // Parse args: --pid N  or  process.exe
+  for (int i = 1; i < argc; i++) {
+    if (!argv[i])
+      continue;
+    if (_wcsicmp(argv[i], L"--pid") == 0 && i + 1 < argc) {
+      pid = (DWORD)_wtoi(argv[i + 1]);
+      i++;
+      continue;
     }
-  }
-  printf("[+] PID = %lu\n", pid);
-
-  /* --- open process --- */
-  HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-  if (!hProc) {
-    printf("[!] OpenProcess failed (err %lu). Run as Admin.\n", GetLastError());
-    system("pause");
-    return 1;
+    if (argv[i][0] == L'-')
+      continue;
+    // treat as process name — put first
+    wcscpy_s(targets[0], 128, argv[i]);
+    targetCount = 1;
   }
 
-  /* --- write DLL path into remote memory --- */
-  size_t cb = (wcslen(dllPath) + 1) * sizeof(wchar_t);
-  LPVOID pRemote =
-      VirtualAllocEx(hProc, NULL, cb, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-  if (!pRemote || !WriteProcessMemory(hProc, pRemote, dllPath, cb, NULL)) {
-    printf("[!] Memory allocation / write failed\n");
-    CloseHandle(hProc);
-    system("pause");
-    return 1;
-  }
-
-  /* --- create remote thread => LoadLibraryW --- */
-  FARPROC pLoadLib =
-      GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
-  HANDLE hThread = CreateRemoteThread(
-      hProc, NULL, 0, (LPTHREAD_START_ROUTINE)pLoadLib, pRemote, 0, NULL);
-
-  if (!hThread) {
-    printf("[!] CreateRemoteThread failed (err %lu). Anti-cheat?\n",
-           GetLastError());
-    VirtualFreeEx(hProc, pRemote, 0, MEM_RELEASE);
-    CloseHandle(hProc);
-    system("pause");
-    return 1;
-  }
-
-  printf("[*] Waiting for LoadLibraryW remote thread...\n");
-  DWORD wait = WaitForSingleObject(hThread, 15000);
-  if (wait != WAIT_OBJECT_0) {
-    printf("[!] Remote thread wait failed/timeout (wait=%lu err=%lu)\n", wait,
-           GetLastError());
-  }
-
-  DWORD remoteExit = 0;
-  if (!GetExitCodeThread(hThread, &remoteExit)) {
-    printf("[!] GetExitCodeThread failed (err %lu)\n", GetLastError());
+  if (pid) {
+    printf("[*] Using --pid %lu\n", pid);
   } else {
-    // LoadLibraryW returns HMODULE in exit code (low 32 bits on x64)
-    printf("[*] LoadLibraryW exit code = 0x%08lX\n", remoteExit);
-    if (remoteExit == 0) {
-      printf("[!] LoadLibraryW returned NULL — DLL failed to load in the game.\n");
-      printf("    Common causes:\n");
-      printf("    - GameHook.dll not next to Injector.exe\n");
-      printf("    - Missing runtime (VS Redistributable x64)\n");
-      printf("    - Anti-cheat blocked LoadLibrary\n");
-      printf("    - Wrong arch (must be x64)\n");
-    } else {
-      printf("[+] DLL module handle looks non-null (inject call succeeded).\n");
-      printf("    If the GAME still closed: GameHook init crashed inside the process.\n");
-      printf("    Check hook_boot.log next to GameHook.dll after restarting the game.\n");
+    printf("[*] Looking for:");
+    for (int i = 0; i < targetCount; i++)
+      wprintf(L" %s", targets[i]);
+    printf("\n");
+
+    for (int i = 0; i < targetCount && !pid; i++)
+      pid = FindPid(targets[i]);
+
+    if (!pid) {
+      printf("[*] Waiting for game to start ...\n");
+      while (!pid) {
+        for (int i = 0; i < targetCount && !pid; i++)
+          pid = FindPid(targets[i]);
+        Sleep(1000);
+      }
     }
   }
 
-  // Confirm game process still alive
-  DWORD procCode = STILL_ACTIVE;
-  if (GetExitCodeProcess(hProc, &procCode) && procCode != STILL_ACTIVE) {
-    printf("[!] Game process exited during inject (code=%lu).\n", procCode);
-    printf("    That usually means the DLL crashed the game on load/init.\n");
-  } else {
-    printf("[+] Game process still running.\n");
-  }
-
-  CloseHandle(hThread);
-  VirtualFreeEx(hProc, pRemote, 0, MEM_RELEASE);
-  CloseHandle(hProc);
+  int rc = DoInject(pid, dllPath);
 
   printf("\nDone. Press any key to close Injector...\n");
   system("pause");
-  return 0;
+  return rc;
 }

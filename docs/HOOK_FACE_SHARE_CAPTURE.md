@@ -25,8 +25,8 @@ Outputs (under `build\bin` or `build\Release`):
    - `LoadLibraryW exit code = 0` → DLL did not load (path/AC/redistributable).
    - Game process exits → DLL init crashed; open `hook_boot.log` next to the DLL.
 6. If a console titled **Face Share Capture Hook** appears, init survived.
-7. Default config has `enable_lua_hook: false` (WinHTTP-only, safer). Set `true` only after WinHTTP works.
-8. In-game: open **Face Share** once.
+7. Default config is **Lua-first**: `enable_lua_hook: true`, `enable_winhttp_fallback: false`.
+8. In-game: open **Face Share** once (press **F5** to re-arm Lua inject if needed).
 9. Capture file: `captures/face_share_capture.jsonl`  
    Boot diagnostics: `hook_boot.log`
 
@@ -40,24 +40,29 @@ node scripts/parse_filepicker_capture.js captures/face_share_capture.jsonl
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `target_process` | `yysls.exe` | Module name for Lua pattern scan |
+| `target_processes` | `wwm.exe`, `yysls.exe`, `WhereWindsMeet.exe` | Injector search list + Lua scan names |
 | `lua_script` | `Scripts/face_share_logger.lua` | Injected logger |
-| `output_file` | `captures/face_share_capture.jsonl` | JSONL events |
-| `enable_lua_hook` | true | Pattern-scan + inject |
-| `enable_winhttp_hook` | true | WinHTTP allowlisted capture |
-| `capture_only_filepicker` | true | Filter non-face-fp traffic |
+| `capture_dir` | `captures` | JSONL directory (created on boot) |
+| `enable_lua_hook` | **true** | Pattern-scan `lua_pcallk` + inject logger |
+| `enable_winhttp_fallback` | **false** | Optional WinHTTP allowlist (15s wait, non-blocking) |
+| `enable_lua_debug_hook` | false | Reserved; never auto-enables `debug.sethook` |
+| `capture_only_filepicker` | true | Filter non-face-fp traffic (WinHTTP path) |
 | `redact_secrets` | true | Redact token/session headers |
 | `capture_full_face_data` | false | Never write full R67 by default |
 | `unsafe_save_session` | false | **Do not** write session.txt |
 
+Injector: `Injector.exe`, `Injector.exe wwm.exe`, or `Injector.exe --pid 20716`.
+
 ## Architecture
 
 ```
-Injector.exe
+Injector.exe [--pid N]
   → LoadLibraryW(GameHook.dll)
+       → create captures/
        → MinHook
+       → scan game-dir modules for lua_load / lua_pcallk (exact 1 match each)
        → lua_pcallk detour → inject face_share_logger.lua (once per lua_State)
-       → WinHTTP Connect/Open/Send/Write/Read/Close (filepicker hosts only)
+       → optional WinHTTP worker only if enable_winhttp_fallback=true
        → captures/face_share_capture.jsonl
 ```
 
