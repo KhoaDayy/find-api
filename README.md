@@ -149,16 +149,15 @@ node scripts/inspect_player_face.js --server CN --id 0111452488
 
 ## 📂 Project Structure
 
-- `player_api.js`: Legacy player/club API.
-- `src/wwm/`: Face inventory API (client, services, routes).
-- `src/parsers/`: Short-code / long-face parsers (no network).
-- `src/hook/`: **Face share capture** (C++ modules: config, WinHTTP, Lua inject, redact).
-- `Scripts/face_share_logger.lua`: Default passive Lua logger (not generic api_logger).
-- `hook_config.json`: Paths/flags next to GameHook.dll (no hard-coded user paths).
-- `scripts/inspect_player_face.js` / `inspect_filepicker_object.js` / `parse_filepicker_capture.js`
-- `docs/HOOK_FACE_SHARE_CAPTURE.md`: How to build/run capture.
-- `docs/C6_UPLOAD_STATIC_TRACE.md`: What is CERTAIN vs UNKNOWN for upload.
-- Legacy: `Scripts/api_logger.lua` (not default).
+- `player_api.js` + `index.html`: Legacy player/club explorer (port 3003).
+- `src/wwm/`: Face inventory / cache / resolve API (port 3005).
+- `src/parsers/`, `src/storage/`, `test/`: parsers, SQLite cache, unit tests.
+- `src/hook/`: Face share capture C++ (config, WinHTTP, Lua inject, redact).
+- `Scripts/face_share_logger.lua`: Default passive Lua logger.
+- `hook_config.example.json`: Config template (copy to `hook_config.json` locally).
+- `Scripts/inspect_*.js`, `Scripts/parse_filepicker_capture.js`: diagnostics / capture parser.
+- `docs/HOOK_FACE_SHARE_CAPTURE.md`, `docs/C6_UPLOAD_STATIC_TRACE.md`.
+- Legacy only (not default): `Scripts/api_logger.lua`.
 
 ### Game hook (passive capture)
 
