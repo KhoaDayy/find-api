@@ -1,108 +1,135 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 cd /d "%~dp0"
 
 echo ============================================
-echo   Game API Hook - Build Script
+echo   Face Share Capture Hook - Build
 echo ============================================
 echo.
 
-:: Create output dir
 if not exist "build" mkdir build
+if not exist "build\bin" mkdir build\bin
+if not exist "build\bin\Scripts" mkdir build\bin\Scripts
+if not exist "build\bin\captures" mkdir build\bin\captures
+if not exist "build\obj" mkdir build\obj
 
-:: ----- Try MSVC Developer Command Prompt (already in path) -----
-where cl >nul 2>&1
-if %ERRORLEVEL% equ 0 goto :msvc_build
-
-:: ----- Try loading MSVC via vcvarsall -----
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VCVARS="
-if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" (
-    set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
+set "VSINSTALL="
+
+if exist "%VSWHERE%" (
+  for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2^>nul`) do set "VSINSTALL=%%i"
 )
-if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" (
-    set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
-)
+
+if defined VSINSTALL if exist "%VSINSTALL%\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=%VSINSTALL%\VC\Auxiliary\Build\vcvarsall.bat"
+if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
+if not defined VCVARS if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
+if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat"
 
 if defined VCVARS (
-    echo [*] Loading MSVC environment...
-    call "%VCVARS%" x64 >nul 2>&1
-    goto :msvc_build
+  echo [*] Loading MSVC x64: %VCVARS%
+  call "%VCVARS%" x64
+  if errorlevel 1 (
+    echo [!] vcvarsall failed
+    goto :fail
+  )
+  goto :msvc_build
 )
 
-:: ----- Try MinGW / GCC -----
 where g++ >nul 2>&1
 if %ERRORLEVEL% equ 0 goto :gcc_build
 
-echo [!] No C++ compiler found.
-echo [!] Install Visual Studio Build Tools or MinGW-w64.
-goto :end
+echo [!] No MSVC vcvarsall or g++ found.
+echo [!] Install VS Build Tools with Desktop C++ workload.
+goto :fail
 
 :msvc_build
-echo [*] Compiler: MSVC (x64)
+where cl >nul 2>&1
+if errorlevel 1 (
+  echo [!] cl.exe not in PATH after vcvarsall
+  goto :fail
+)
+echo [*] Compiler: MSVC
 echo.
 
-echo [1/2] Building GameHook.dll ...
-cl /nologo /LD /O2 /EHsc /MD ^
-    /I"lib\minhook\include" /I"src" ^
-    src\dllmain.cpp ^
-    lib\minhook\src\buffer.c ^
-    lib\minhook\src\hook.c ^
-    lib\minhook\src\trampoline.c ^
-    lib\minhook\src\hde\hde64.c ^
-    /Fe:"build\GameHook.dll" /Fo:"build\\" ^
-    /link user32.lib winhttp.lib /OUT:"build\GameHook.dll"
+echo [1/2] GameHook.dll ...
+cl /nologo /LD /O2 /EHsc /MD /std:c++17 /DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE ^
+  /I"lib\minhook\include" /I"src" ^
+  src\dllmain.cpp ^
+  src\hook\config.cpp ^
+  src\hook\capture_writer.cpp ^
+  src\hook\redact.cpp ^
+  src\hook\winhttp_capture.cpp ^
+  src\hook\lua_runtime_hook.cpp ^
+  lib\minhook\src\buffer.c ^
+  lib\minhook\src\hook.c ^
+  lib\minhook\src\trampoline.c ^
+  lib\minhook\src\hde\hde64.c ^
+  /Fo"build\obj\\" ^
+  /Fe:"build\bin\GameHook.dll" ^
+  /link /DLL user32.lib winhttp.lib psapi.lib advapi32.lib
 if errorlevel 1 goto :fail
 
-echo.
-echo [2/2] Building Injector.exe ...
-cl /nologo /O2 /EHsc /MD ^
-    src\injector.cpp ^
-    /Fe:"build\Injector.exe" /Fo:"build\\"
+echo [2/2] Injector.exe ...
+cl /nologo /O2 /EHsc /MD /std:c++17 /DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE ^
+  src\injector.cpp ^
+  /Fo"build\obj\\" ^
+  /Fe:"build\bin\Injector.exe"
 if errorlevel 1 goto :fail
+
+copy /Y "Scripts\face_share_logger.lua" "build\bin\Scripts\" >nul
+if exist "hook_config.example.json" copy /Y "hook_config.example.json" "build\bin\" >nul
+if exist "hook_config.json" (
+  copy /Y "hook_config.json" "build\bin\" >nul
+) else if exist "hook_config.example.json" (
+  copy /Y "hook_config.example.json" "build\bin\hook_config.json" >nul
+)
 goto :ok
 
 :gcc_build
-echo [*] Compiler: MinGW / GCC
-echo.
-
-echo [1/2] Building GameHook.dll ...
-g++ -shared -O2 -std=c++17 ^
-    -I"lib\minhook\include" -I"src" ^
-    src\dllmain.cpp ^
-    lib\minhook\src\buffer.c ^
-    lib\minhook\src\hook.c ^
-    lib\minhook\src\trampoline.c ^
-    lib\minhook\src\hde\hde64.c ^
-    -luser32 -lwinhttp -static ^
-    -o build\GameHook.dll
+echo [*] Compiler: MinGW g++
+g++ -shared -O2 -std=c++17 -I"lib/minhook/include" -I"src" ^
+  src/dllmain.cpp src/hook/config.cpp src/hook/capture_writer.cpp src/hook/redact.cpp ^
+  src/hook/winhttp_capture.cpp src/hook/lua_runtime_hook.cpp ^
+  lib/minhook/src/buffer.c lib/minhook/src/hook.c lib/minhook/src/trampoline.c lib/minhook/src/hde/hde64.c ^
+  -luser32 -lwinhttp -lpsapi -static -o build/bin/GameHook.dll
 if errorlevel 1 goto :fail
-
-echo [2/2] Building Injector.exe ...
-g++ -O2 -std=c++17 src\injector.cpp -static -o build\Injector.exe
+g++ -O2 -std=c++17 src/injector.cpp -static -o build/bin/Injector.exe
 if errorlevel 1 goto :fail
+copy /Y Scripts\face_share_logger.lua build\bin\Scripts\ >nul
+if exist hook_config.example.json copy /Y hook_config.example.json build\bin\ >nul
+if exist hook_config.json (
+  copy /Y hook_config.json build\bin\ >nul
+) else if exist hook_config.example.json (
+  copy /Y hook_config.example.json build\bin\hook_config.json >nul
+)
 goto :ok
 
 :ok
+if not exist "build\bin\GameHook.dll" goto :fail
+if not exist "build\bin\Injector.exe" goto :fail
+if not exist "build\bin\Scripts\face_share_logger.lua" goto :fail
+if not exist "build\bin\hook_config.json" if not exist "build\bin\hook_config.example.json" goto :fail
+
 echo.
 echo ============================================
 echo   BUILD OK
-echo   build\GameHook.dll
-echo   build\Injector.exe
+echo   build\bin\GameHook.dll
+echo   build\bin\Injector.exe
+echo   build\bin\Scripts\face_share_logger.lua
+echo   build\bin\hook_config.json
 echo ============================================
 echo.
 echo Usage:
-echo   1. Copy build\GameHook.dll and build\Injector.exe
-echo      to the same folder (+ Scripts\api_logger.lua)
-echo   2. Start yysls.exe (the game)
-echo   3. Run Injector.exe as Administrator
-echo   4. Press F5 in the hook console to inject
-echo   5. Check api_log.txt for captured API calls
+echo   1. Start game (see target_process in hook_config.json^)
+echo   2. Run build\bin\Injector.exe as Admin
+echo   3. F5 in console to re-inject Lua
+echo   4. In-game Face Share once
+echo   5. node scripts/parse_filepicker_capture.js build\bin\captures\face_share_capture.jsonl
 echo.
-goto :end
+exit /b 0
 
 :fail
 echo.
-echo [!] Build FAILED. Check errors above.
-
-:end
-pause
+echo [!] Build FAILED.
+exit /b 1

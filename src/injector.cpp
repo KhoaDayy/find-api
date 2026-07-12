@@ -1,11 +1,12 @@
 /*
- *  Injector.cpp  –  Injects GameHook.dll into yysls.exe
+ *  Injector.cpp  –  Injects GameHook.dll into wwm.exe
  *  No TlHelp32.h dependency (uses runtime-loaded functions)
  */
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* ---------- Manual TlHelp32 definitions ---------- */
 #define TH32CS_SNAPPROCESS 0x00000002
@@ -62,11 +63,50 @@ static DWORD FindPid(const wchar_t *name) {
   return pid;
 }
 
-int wmain() {
-  const wchar_t *target = L"yysls.exe";
+/* Read target_process from hook_config.json next to injector (ASCII only). */
+static void LoadTargetProcess(wchar_t *out, size_t outCount) {
+  wcscpy_s(out, outCount, L"yysls.exe");
+  wchar_t cfgPath[MAX_PATH];
+  GetModuleFileNameW(NULL, cfgPath, MAX_PATH);
+  wchar_t *sl = wcsrchr(cfgPath, L'\\');
+  if (sl)
+    wcscpy_s(sl + 1, MAX_PATH - (size_t)(sl - cfgPath + 1), L"hook_config.json");
+  else
+    wcscpy_s(cfgPath, L"hook_config.json");
 
-  printf("=== Direct DLL Injector ===\n");
-  printf("Target: yysls.exe\n\n");
+  FILE *f = nullptr;
+  if (_wfopen_s(&f, cfgPath, L"rb") != 0 || !f)
+    return;
+  char buf[4096] = {0};
+  size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+  fclose(f);
+  if (!n)
+    return;
+  buf[n] = 0;
+  const char *key = "\"target_process\"";
+  char *p = strstr(buf, key);
+  if (!p)
+    return;
+  p = strchr(p + strlen(key), '"');
+  if (!p)
+    return;
+  p++;
+  char *e = strchr(p, '"');
+  if (!e || e <= p || (size_t)(e - p) >= 120)
+    return;
+  char narrow[128] = {0};
+  memcpy(narrow, p, (size_t)(e - p));
+  MultiByteToWideChar(CP_UTF8, 0, narrow, -1, out, (int)outCount);
+}
+
+int wmain(int argc, wchar_t **argv) {
+  wchar_t target[128];
+  LoadTargetProcess(target, 128);
+  if (argc >= 2 && argv[1] && argv[1][0])
+    wcscpy_s(target, argv[1]);
+
+  printf("=== Face Share Capture Injector ===\n");
+  wprintf(L"Target: %s\n\n", target);
 
   if (!InitToolhelp()) {
     printf("[!] Failed to load Toolhelp functions\n");
@@ -92,12 +132,23 @@ int wmain() {
   }
 
   /* --- find process --- */
-  printf("[*] Looking for %ls ...\n", target);
+  wprintf(L"[*] Looking for %s ...\n", target);
   DWORD pid = FindPid(target);
+  if (!pid) {
+    /* also try alternate common names */
+    if (_wcsicmp(target, L"yysls.exe") == 0)
+      pid = FindPid(L"wwm.exe");
+    else if (_wcsicmp(target, L"wwm.exe") == 0)
+      pid = FindPid(L"yysls.exe");
+  }
   if (!pid) {
     printf("[*] Waiting for game to start ...\n");
     while (!pid) {
       pid = FindPid(target);
+      if (!pid && _wcsicmp(target, L"yysls.exe") == 0)
+        pid = FindPid(L"wwm.exe");
+      if (!pid && _wcsicmp(target, L"wwm.exe") == 0)
+        pid = FindPid(L"yysls.exe");
       Sleep(1000);
     }
   }

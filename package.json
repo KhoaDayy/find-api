@@ -1,8 +1,28 @@
 {
+  "name": "find-api",
+  "private": true,
+  "scripts": {
+    "test": "node test/parsers.test.js && node test/inventory.test.js && node test/cache.test.js && node test/hardening.test.js && node test/resolve.test.js && node test/filepicker_meta.test.js && node test/upload_capture.test.js && node test/hook_redact.test.js",
+    "test:hook": "node test/hook_redact.test.js",
+    "test:parsers": "node test/parsers.test.js",
+    "test:inventory": "node test/inventory.test.js",
+    "test:cache": "node test/cache.test.js",
+    "test:hardening": "node test/hardening.test.js",
+    "test:resolve": "node test/resolve.test.js",
+    "test:fpmeta": "node test/filepicker_meta.test.js",
+    "test:upload": "node test/upload_capture.test.js",
+    "inspect:face": "node scripts/inspect_player_face.js",
+    "inspect:fp": "node scripts/inspect_filepicker_object.js",
+    "parse:capture": "node scripts/parse_filepicker_capture.js",
+    "start:wwm": "node src/wwm/server.js"
+  },
   "dependencies": {
     "@msgpack/msgpack": "^3.1.3",
     "axios": "^1.13.5",
+    "color-convert": "^3.1.3",
     "cors": "^2.8.6",
+    "discord.js": "^14.25.1",
+    "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "msgpack-lite": "^0.1.26"
   }

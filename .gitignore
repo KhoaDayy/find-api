@@ -3,11 +3,72 @@ __pycache__/
 *.pem
 *.log
 api_log.txt
+winhttp_log.txt
+rpc_capture.txt
+rpc_plaintext.txt
+
+# secrets / local session
 session.txt
+session.cn.txt
+session.global.txt
+session*.txt
+.env
+.env.*
+
+# local runtime data
+debug/
+data/
+data/*.db
+data/*.db-shm
+data/*.db-wal
 build/
-.vscode/
-.DS_Store
+captures/
+dist/
+
+# personal hook config (commit example only)
+hook_config.json
+
+# compiler junk
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.iobj
+*.ipdb
+
+# misc local dumps / tooling noise
+.codegraph/
+font_hook/
 *.bin
 lookup_out*.json
 temp_*
 git_log.txt
+git_status_full.txt
+.git_status*
+.vscode/
+.DS_Store
+
+# large / sensitive local dumps
+*_result.json
+*_output.json
+*_dump.json
+face_data_dump.json
+nos_face_data.json
+studio_data_base64.txt
+studio_raw.txt
+extracted_*
+full_dump_cn.json
+brief_result.json
+designer_result.json
+new_plan_result.json
+convert_output.json
+convert_result.json
+output_*.txt
+class_discovery.txt
+deep_discovery.txt
+modules_discovery.txt
+guild_endpoint.txt
+club_cmd.txt
+club_out.txt
+wwm_copy.exe

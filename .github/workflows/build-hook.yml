@@ -1,0 +1,111 @@
+name: Build Windows Hook
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/hook/**"
+      - "src/dllmain.cpp"
+      - "src/injector.cpp"
+      - "src/pattern_scan.h"
+      - "lib/minhook/**"
+      - "Scripts/face_share_logger.lua"
+      - "hook_config.example.json"
+      - "hook_config.json"
+      - "CMakeLists.txt"
+      - "build.bat"
+      - ".github/workflows/build-hook.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-hook:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate MSVC and build x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe not found"
+          }
+
+          $vsPath = & $vswhere `
+            -latest `
+            -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if (-not $vsPath) {
+            throw "MSVC x64 toolchain not found"
+          }
+
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) {
+            # fallback to vcvarsall x64
+            $vcvarsAll = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+            if (-not (Test-Path $vcvarsAll)) {
+              throw "vcvars64.bat / vcvarsall.bat not found under $vsPath"
+            }
+            Write-Host "Using vcvarsall.bat from: $vsPath"
+            cmd.exe /d /s /c "`"$vcvarsAll`" x64 && call build.bat"
+          } else {
+            Write-Host "Visual Studio: $vsPath"
+            Write-Host "Using vcvars64.bat"
+            cmd.exe /d /s /c "`"$vcvars`" && call build.bat"
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "build.bat failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Ensure example config in output
+        shell: pwsh
+        run: |
+          $bin = "build/bin"
+          if (-not (Test-Path $bin)) { throw "Missing build/bin" }
+          if (Test-Path "hook_config.example.json") {
+            Copy-Item "hook_config.example.json" (Join-Path $bin "hook_config.example.json") -Force
+          }
+          if (-not (Test-Path (Join-Path $bin "hook_config.json")) -and (Test-Path "hook_config.example.json")) {
+            Copy-Item "hook_config.example.json" (Join-Path $bin "hook_config.json") -Force
+          }
+          # Do not ship empty captures as secrets; keep directory only
+          $cap = Join-Path $bin "captures"
+          if (-not (Test-Path $cap)) { New-Item -ItemType Directory -Path $cap | Out-Null }
+
+      - name: Verify output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "build/bin")) {
+            throw "Missing build/bin directory"
+          }
+
+          $dll = Get-ChildItem "build/bin" -Recurse -Filter "GameHook.dll" | Select-Object -First 1
+          $injector = Get-ChildItem "build/bin" -Recurse -Filter "Injector.exe" | Select-Object -First 1
+          $lua = Get-ChildItem "build/bin" -Recurse -Filter "face_share_logger.lua" | Select-Object -First 1
+
+          if (-not $dll) { throw "GameHook.dll not found" }
+          if (-not $injector) { throw "Injector.exe not found" }
+          if (-not $lua) { throw "face_share_logger.lua not found in output" }
+
+          Write-Host "DLL: $($dll.FullName) — $($dll.Length) bytes"
+          Write-Host "Injector: $($injector.FullName) — $($injector.Length) bytes"
+          Write-Host "Lua: $($lua.FullName) — $($lua.Length) bytes"
+          Get-ChildItem "build/bin" -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+
+      - name: Upload hook artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wwm-face-share-hook-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            build/bin/**

@@ -24,9 +24,10 @@ static std::vector<PatternByte> ParsePattern(const char* pattern) {
     return bytes;
 }
 
-static uintptr_t PatternScan(uintptr_t base, size_t size, const char* pattern) {
+static std::vector<uintptr_t> PatternScanAll(uintptr_t base, size_t size, const char* pattern) {
     auto bytes = ParsePattern(pattern);
-    if (bytes.empty()) return 0;
+    std::vector<uintptr_t> results;
+    if (bytes.empty()) return results;
 
     const size_t patLen = bytes.size();
 
@@ -39,7 +40,14 @@ static uintptr_t PatternScan(uintptr_t base, size_t size, const char* pattern) {
                 break;
             }
         }
-        if (found) return base + i;
+        if (found) {
+            results.push_back(base + i);
+        }
     }
-    return 0;
+    return results;
+}
+
+static uintptr_t PatternScan(uintptr_t base, size_t size, const char* pattern) {
+    auto results = PatternScanAll(base, size, pattern);
+    return results.empty() ? 0 : results[0];
 }
