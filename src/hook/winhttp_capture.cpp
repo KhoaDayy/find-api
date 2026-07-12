@@ -279,9 +279,8 @@ bool HookOne(HMODULE h, const char *name, LPVOID detour, LPVOID *orig) {
   void *p = (void *)GetProcAddress(h, name);
   if (!p)
     return false;
+  // Create only first; enable all together below — fewer Freeze/Unfreeze races.
   if (MH_CreateHook(p, detour, orig) != MH_OK)
-    return false;
-  if (MH_EnableHook(p) != MH_OK)
     return false;
   return true;
 }
@@ -290,9 +289,9 @@ bool HookOne(HMODULE h, const char *name, LPVOID detour, LPVOID *orig) {
 
 bool InstallWinHttpCapture(const HookConfig &cfg) {
   g_cfg = cfg;
+  // Do not LoadLibrary winhttp if the game never loaded it — injecting a new
+  // network DLL mid-run can trip AC. Only hook if already mapped.
   HMODULE h = GetModuleHandleA("winhttp.dll");
-  if (!h)
-    h = LoadLibraryA("winhttp.dll");
   if (!h)
     return false;
 
@@ -310,12 +309,17 @@ bool InstallWinHttpCapture(const HookConfig &cfg) {
   any |= HookOne(h, "WinHttpReadData", (LPVOID)&Detour_ReadData, (LPVOID *)&oReadData);
   any |= HookOne(h, "WinHttpCloseHandle", (LPVOID)&Detour_CloseHandle, (LPVOID *)&oCloseHandle);
 
-  if (any) {
-    WriteCaptureEvent("winhttp", "winhttp_hooks_installed",
-                      std::string("{\"ok\":true,\"capture_only_filepicker\":") +
-                          (cfg.capture_only_filepicker ? "true" : "false") + "}");
-  }
-  return any;
+  if (!any)
+    return false;
+
+  // Single enable pass for all pending hooks.
+  if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK)
+    return false;
+
+  WriteCaptureEvent("winhttp", "winhttp_hooks_installed",
+                    std::string("{\"ok\":true,\"capture_only_filepicker\":") +
+                        (cfg.capture_only_filepicker ? "true" : "false") + "}");
+  return true;
 }
 
 void UninstallWinHttpCapture() {

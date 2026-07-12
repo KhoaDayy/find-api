@@ -1,7 +1,6 @@
 /*
  * GameHook.dll — passive Face FilePicker share capture only.
- * Boot is deferred and fail-soft so a bad pattern match does not take
- * down the game process during LoadLibrary.
+ * Boot is deferred and fail-soft so a bad step does not take down the game.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -21,19 +20,9 @@ static HMODULE g_hSelf = nullptr;
 static HookConfig g_cfg;
 static std::string g_dllDir;
 static HANDLE g_initThread = nullptr;
-static bool g_running = true;
+static volatile LONG g_running = 1;
 static bool g_consoleReady = false;
 
-static std::string GetDllDir() {
-  char path[MAX_PATH] = {};
-  GetModuleFileNameA(g_hSelf, path, MAX_PATH);
-  char *p = strrchr(path, '\\');
-  if (p)
-    *(p + 1) = '\0';
-  return path;
-}
-
-// Always available even if AllocConsole fails under anti-cheat.
 static void BootLog(const char *fmt, ...) {
   char dir[MAX_PATH] = {};
   if (g_hSelf)
@@ -65,8 +54,6 @@ static void BootLog(const char *fmt, ...) {
   fclose(f);
 }
 
-// AllocConsole is a common anti-cheat tripwire. Only open if
-// GAMEHOOK_CONSOLE=1 is set in the process environment.
 static void TryOpenConsole() {
   if (g_consoleReady)
     return;
@@ -102,99 +89,156 @@ static void ConPrint(const char *fmt, ...) {
   }
 }
 
-// No C++ objects with destructors in functions that use __try.
-static int InitHooksNoExcept() {
-  TryOpenConsole();
-  g_dllDir = GetDllDir();
+// --- steps: no __try inside these; C++ OK ---
+
+static int Step_LoadConfig() {
+  char path[MAX_PATH] = {};
+  GetModuleFileNameA(g_hSelf, path, MAX_PATH);
+  char *p = strrchr(path, '\\');
+  if (p)
+    *(p + 1) = '\0';
+  g_dllDir.assign(path);
+  g_cfg = LoadConfig(g_dllDir);
+  return 0;
+}
+
+static int Step_InitCapture() {
+  // Prefer capture file next to DLL (same folder user can write).
+  char out[MAX_PATH] = {};
+  if (!g_cfg.output_file.empty() &&
+      (g_cfg.output_file[0] == '\\' || g_cfg.output_file[0] == '/' ||
+       (g_cfg.output_file.size() > 1 && g_cfg.output_file[1] == ':'))) {
+    _snprintf_s(out, _TRUNCATE, "%s", g_cfg.output_file.c_str());
+  } else {
+    _snprintf_s(out, _TRUNCATE, "%s%s", g_dllDir.c_str(),
+                g_cfg.output_file.empty() ? "captures\\face_share_capture.jsonl"
+                                          : g_cfg.output_file.c_str());
+  }
+  InitCaptureWriter(std::string(out));
+  ConPrint("Capture: %s", out);
+  return 0;
+}
+
+static int Step_MinHook() {
+  MH_STATUS st = MH_Initialize();
+  if (st != MH_OK) {
+    ConPrint("[!] MinHook init failed status=%d", (int)st);
+    return 1;
+  }
+  ConPrint("[+] MinHook ready");
+  return 0;
+}
+
+static int Step_WinHttp() {
+  if (!g_cfg.enable_winhttp_hook) {
+    ConPrint("[*] WinHTTP capture disabled by config");
+    return 0;
+  }
+  if (InstallWinHttpCapture(g_cfg))
+    ConPrint("[+] WinHTTP capture installed (filepicker allowlist)");
+  else
+    ConPrint("[!] WinHTTP capture failed (non-fatal)");
+  return 0;
+}
+
+static int Step_Lua() {
+  if (!g_cfg.enable_lua_hook) {
+    ConPrint("[*] Lua hook disabled by config (safer default)");
+    return 0;
+  }
+  if (InstallLuaRuntimeHook(g_cfg, g_dllDir))
+    ConPrint("[+] Lua runtime hook installed (injects on next pcall)");
+  else
+    ConPrint("[!] Lua hook failed (signatures/module). WinHTTP may still work.");
+  return 0;
+}
+
+// SEH gate: function pointers only, no C++ objects with dtors here.
+static int RunStep(const char *name, int (*fn)()) {
+  BootLog("step enter: %s", name);
+  int rc = 1;
+  __try {
+    rc = fn();
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    BootLog("step SEH %s code=0x%08lX", name, GetExceptionCode());
+    return -1;
+  }
+  BootLog("step leave: %s rc=%d", name, rc);
+  return rc;
+}
+
+static DWORD WINAPI InitThread(LPVOID) {
+  Sleep(3000);
+
+  __try {
+    TryOpenConsole();
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    BootLog("TryOpenConsole SEH code=0x%08lX", GetExceptionCode());
+  }
 
   ConPrint("========================================");
   ConPrint("  Face FilePicker Share Capture");
   ConPrint("  Passive only — no request mutation");
   ConPrint("========================================");
-  ConPrint("DLL dir: %s", g_dllDir.c_str());
 
-  g_cfg = LoadConfig(g_dllDir);
+  if (RunStep("load_config", Step_LoadConfig) < 0) {
+    BootLog("FATAL: load_config crashed — abort init");
+    return 1;
+  }
+  ConPrint("DLL dir: %s", g_dllDir.c_str());
   ConPrint("Config: lua_hook=%d winhttp=%d script=%s",
            g_cfg.enable_lua_hook ? 1 : 0, g_cfg.enable_winhttp_hook ? 1 : 0,
            g_cfg.lua_script.c_str());
-
-  std::string out = ResolvePath(g_dllDir, g_cfg.output_file);
-  InitCaptureWriter(out);
-  ConPrint("Capture: %s", out.c_str());
   ConPrint("Boot log: %shook_boot.log", g_dllDir.c_str());
-  ConPrint("F5 = re-inject Lua logger");
   ConPrint("========================================");
 
-  WriteCaptureEvent("native", "dll_loaded",
-                    "{\"dll_dir\":" + JsonString(g_dllDir) +
-                        ",\"output\":" + JsonString(out) + "}");
-
-  if (MH_Initialize() != MH_OK) {
-    ConPrint("[!] MinHook init failed");
-    WriteCaptureEvent("native", "error", "{\"error\":\"minhook_init_failed\"}");
+  // Install hooks BEFORE capture file I/O — previous crash was right after
+  // Config while opening the capture path (0xC0000005).
+  if (RunStep("minhook", Step_MinHook) != 0) {
+    ConPrint("[!] Abort: MinHook unavailable");
     return 1;
   }
-  ConPrint("[+] MinHook ready");
 
-  if (g_cfg.enable_winhttp_hook) {
-    if (InstallWinHttpCapture(g_cfg))
-      ConPrint("[+] WinHTTP capture installed (filepicker allowlist)");
-    else
-      ConPrint("[!] WinHTTP capture failed (non-fatal)");
-  } else {
-    ConPrint("[*] WinHTTP capture disabled by config");
-  }
+  RunStep("winhttp", Step_WinHttp);
+  RunStep("lua", Step_Lua);
 
-  if (g_cfg.enable_lua_hook) {
-    if (InstallLuaRuntimeHook(g_cfg, g_dllDir))
-      ConPrint("[+] Lua runtime hook installed (injects on next pcall)");
-    else
-      ConPrint("[!] Lua hook failed (signatures/module). WinHTTP may still work.");
-  } else {
-    ConPrint("[*] Lua hook disabled by config (safer default)");
+  if (RunStep("init_capture", Step_InitCapture) < 0)
+    ConPrint("[!] Capture writer crashed (non-fatal) — hooks already installed");
+  else {
+    __try {
+      WriteCaptureEvent("native", "init_complete", "{\"ok\":true}");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      BootLog("WriteCaptureEvent SEH code=0x%08lX", GetExceptionCode());
+    }
   }
 
   ConPrint("[*] Init complete. Use Face Share in-game.");
-  WriteCaptureEvent("native", "init_complete", "{\"ok\":true}");
-  return 0;
-}
 
-static DWORD WINAPI InitThread(LPVOID) {
-  // Stay out of DllMain loader lock; wait past early process init.
-  Sleep(3000);
-
-  int rc = 1;
-  __try {
-    rc = InitHooksNoExcept();
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    BootLog("FATAL SEH in InitThread code=0x%08lX", GetExceptionCode());
-    return 1;
-  }
-
-  while (g_running) {
+  while (InterlockedCompareExchange(&g_running, 1, 1) == 1) {
     if (GetAsyncKeyState(VK_F5) & 1) {
       ConPrint("[*] F5: re-inject Lua");
-      RequestLuaInject();
+      __try {
+        RequestLuaInject();
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        BootLog("RequestLuaInject SEH code=0x%08lX", GetExceptionCode());
+      }
     }
     Sleep(100);
   }
-  return (DWORD)rc;
+  return 0;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_ATTACH) {
     g_hSelf = hModule;
     DisableThreadLibraryCalls(hModule);
-    // Minimal work only — no MinHook / pattern scan here
     BootLog("DllMain ATTACH pid=%lu", GetCurrentProcessId());
     g_initThread = CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
     if (!g_initThread)
       BootLog("CreateThread failed err=%lu", GetLastError());
   } else if (reason == DLL_PROCESS_DETACH) {
-    // Process teardown: do not touch hooks/heaps here. Detours may still be
-    // on other threads; MH_Uninitialize under loader lock is a crash source.
     BootLog("DllMain DETACH (skip MH_Uninitialize)");
-    g_running = false;
+    InterlockedExchange(&g_running, 0);
   }
   return TRUE;
 }
