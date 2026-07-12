@@ -1,6 +1,9 @@
 /*
  * GameHook.dll — passive Face FilePicker share capture only.
  * Boot is deferred and fail-soft so a bad step does not take down the game.
+ *
+ * MSVC rule: never put __try in a function that constructs C++ objects
+ * with destructors (error C2712). SEH lives only in pure C wrappers.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -89,7 +92,7 @@ static void ConPrint(const char *fmt, ...) {
   }
 }
 
-// --- steps: no __try inside these; C++ OK ---
+// --- C++ steps (no __try) ---
 
 static int Step_LoadConfig() {
   char path[MAX_PATH] = {};
@@ -103,7 +106,6 @@ static int Step_LoadConfig() {
 }
 
 static int Step_InitCapture() {
-  // Prefer capture file next to DLL (same folder user can write).
   char out[MAX_PATH] = {};
   if (!g_cfg.output_file.empty() &&
       (g_cfg.output_file[0] == '\\' || g_cfg.output_file[0] == '/' ||
@@ -153,9 +155,19 @@ static int Step_Lua() {
   return 0;
 }
 
-// SEH gate: function pointers only, no C++ objects with dtors here.
-static int RunStep(const char *name, int (*fn)()) {
-  BootLog("step enter: %s", name);
+static int Step_WriteInitComplete() {
+  WriteCaptureEvent("native", "init_complete", "{\"ok\":true}");
+  return 0;
+}
+
+static int Step_RequestLua() {
+  RequestLuaInject();
+  return 0;
+}
+
+// --- SEH gates: no C++ objects with destructors ---
+
+static int SehCall(const char *name, int (*fn)()) {
   int rc = 1;
   __try {
     rc = fn();
@@ -167,14 +179,25 @@ static int RunStep(const char *name, int (*fn)()) {
   return rc;
 }
 
-static DWORD WINAPI InitThread(LPVOID) {
-  Sleep(3000);
-
+static int SehTryOpenConsole() {
   __try {
     TryOpenConsole();
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     BootLog("TryOpenConsole SEH code=0x%08lX", GetExceptionCode());
+    return -1;
   }
+  return 0;
+}
+
+static int RunStep(const char *name, int (*fn)()) {
+  BootLog("step enter: %s", name);
+  return SehCall(name, fn);
+}
+
+static DWORD WINAPI InitThread(LPVOID) {
+  Sleep(3000);
+
+  SehTryOpenConsole();
 
   ConPrint("========================================");
   ConPrint("  Face FilePicker Share Capture");
@@ -192,8 +215,7 @@ static DWORD WINAPI InitThread(LPVOID) {
   ConPrint("Boot log: %shook_boot.log", g_dllDir.c_str());
   ConPrint("========================================");
 
-  // Install hooks BEFORE capture file I/O — previous crash was right after
-  // Config while opening the capture path (0xC0000005).
+  // Hooks before capture I/O — previous AV was right after Config.
   if (RunStep("minhook", Step_MinHook) != 0) {
     ConPrint("[!] Abort: MinHook unavailable");
     return 1;
@@ -204,24 +226,15 @@ static DWORD WINAPI InitThread(LPVOID) {
 
   if (RunStep("init_capture", Step_InitCapture) < 0)
     ConPrint("[!] Capture writer crashed (non-fatal) — hooks already installed");
-  else {
-    __try {
-      WriteCaptureEvent("native", "init_complete", "{\"ok\":true}");
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-      BootLog("WriteCaptureEvent SEH code=0x%08lX", GetExceptionCode());
-    }
-  }
+  else
+    RunStep("write_init_complete", Step_WriteInitComplete);
 
   ConPrint("[*] Init complete. Use Face Share in-game.");
 
   while (InterlockedCompareExchange(&g_running, 1, 1) == 1) {
     if (GetAsyncKeyState(VK_F5) & 1) {
       ConPrint("[*] F5: re-inject Lua");
-      __try {
-        RequestLuaInject();
-      } __except (EXCEPTION_EXECUTE_HANDLER) {
-        BootLog("RequestLuaInject SEH code=0x%08lX", GetExceptionCode());
-      }
+      RunStep("request_lua", Step_RequestLua);
     }
     Sleep(100);
   }
