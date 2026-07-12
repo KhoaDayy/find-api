@@ -1,157 +1,108 @@
-# C6 — WWM Lite Lua loader analysis (verification pass)
+# C6 — WWM Lite Lua loader analysis (sibling wrappers + adapter)
 
 **Module SHA-256:** `0cfdfcc69d543af7428aac39f8bc3ea5db42563b84101b775ab710a6d050e8b1`  
-**lua_pcallk RVA:** `0x486C270` (matches=1)  
-**Legacy lua_load matches:** 0  
-**Runtime hook enabled:** **NO** (`verified: false`)
+**lua_pcallk RVA:** `0x486C270`  
+**Runtime adapter:** build-specific **`luaL_loadbufferx`** when in-process scan finds **exactly 1** match and inner `E8` → `0x486C600`.
 
-Machine-readable: run `Scripts/verify_lua_loader.py` → `captures/lua_loader_verification.json` (gitignored under `captures/`).
-
-## Final verdict object
-
-```json
-{
-  "verified": false,
-  "loader_rva": "0x486F0A0",
-  "loader_kind": "luaL_loadbufferx",
-  "prototype": "int __cdecl(lua_State* L, const char* buff, size_t size, const char* name, const char* mode)",
-  "loadstring_wrapper_rva": "0x486F0E0",
-  "loadstring_calls_loader": false,
-  "pcall_flow_verified": true,
-  "load_string_xref_verified": false,
-  "signature_matches": null,
-  "confidence": 75,
-  "enable_runtime": false
-}
-```
-
-## 1. Relation `0x486F0E0` → `0x486F0A0`
-
-| Check | Result |
-|-------|--------|
-| F0E0 receives RCX=L, RDX=string | **YES** (callers) |
-| F0E0 strlen(RDX) in prologue | **YES** |
-| F0E0 calls F0A0 with (L, buf, len, name, mode) | **NOT PROVEN** — body truncated after `mov r9, rdx` in probe first32 |
-
-**Conclusion:** F0E0 is loadstring-**shaped**, but cannot be classified as `luaL_loadstring` wrapping F0A0 until full body is read from a live process.
-
-## 2. Prototype of `0x486F0A0` (from callers, not prologue alone)
-
-### Strongest caller: `0x490E8B1` → F0A0 → pcall `0x490E8CF`
+## Wrapper model (verified structure)
 
 ```
-lea  r9, [rip+const]       ; name
-mov  [rsp+0x20], rbp       ; mode (5th arg)
-lea  rdx, [rsp+0x30]       ; buff
-mov  rcx, rdi              ; L
-call 0x486F0A0
-test eax, eax
-jne  fail
-...
-call 0x486C270             ; lua_pcallk
-test eax, eax
+0x486F0A0  luaL_loadbufferx-like  ──┐
+                                     ├── call 0x486C600  (lua_load)
+0x486F0E0  luaL_loadstring-like   ──┘
 ```
 
-### Thin wrapper: `0x214FD15` → F0A0 → pcall `0x214FD3B`
+**Relationship:** siblings (both call the same core loader).  
+**Not** F0E0 → F0A0.
+
+### 0x486F0A0 (inject adapter)
 
 ```
-mov  rbx, rcx              ; save L
-mov  [rsp+0x20], 0         ; mode = NULL
-call 0x486F0A0             ; rdx/r8/r9 from caller
-test eax, eax
-jne  skip_pcall
-xor  r9d,r9d / r8d / edx
-mov  [rsp+0x20], 0
-mov  rcx, rbx
-call 0x486C270             ; pcall only if load OK
+sub  rsp, 48h
+mov  rax, [rsp+70h]          ; mode (5th arg)
+mov  [rsp+30h], rdx          ; buff
+lea  rdx, [rip+rel]          ; reader callback (~0x48701A0)
+mov  [rsp+38h], r8           ; size
+lea  r8, [rsp+30h]           ; &context {buff,size}
+mov  [rsp+20h], rax          ; mode
+call 0x486C600               ; lua_load(L, reader, data, name, mode)
+add  rsp, 48h
+ret
 ```
 
-| Arg | Semantic |
-|-----|----------|
-| RCX | `lua_State* L` |
-| RDX | `const char* buff` |
-| R8 | `size_t size` (prologue also saves r8 to `[rsp+0x38]`) |
-| R9 | `const char* name` (set by caller or default inside) |
-| `[rsp+20h]` | `const char* mode` (often 0 / NULL) |
-| EAX return | Lua status; `test eax,eax` before pcall |
+Prototype:
 
-**Kind hypothesis remains `luaL_loadbufferx`.** Inner call to `lua_load` still not visible (body incomplete).
+```c
+int luaL_loadbufferx(lua_State *L, const char *buff, size_t size,
+                     const char *name, const char *mode);
+```
 
-## 3. Load → pcall flow — **VERIFIED**
-
-| Loader call | Loader | `test eax` | pcall | `test eax` after pcall |
-|-------------|--------|------------|-------|-------------------------|
-| `0x1F7EE86` | F0E0 | yes | `0x1F7EEA9` | yes |
-| `0x214FD15` | F0A0 | yes | `0x214FD3B` | (success path) |
-| `0x2F623F8` | F0E0 | yes | `0x2F6242D` | yes |
-| `0x490E8B1` | F0A0 | yes | `0x490E8CF` | yes |
-
-Canonical pattern:
+### 0x486F0E0 (sibling, not used for inject)
 
 ```
-call loader
+sub rsp,48h
+mov [rsp+30h], rdx
+strlen(RDX)
+mov r9, rdx                  ; chunkname = source string
+mov [rsp+38h], rax           ; len
+lea rdx, [rip+rel]           ; same reader family
+mov [rsp+20h], 0             ; mode = NULL
+lea r8, [rsp+30h]
+call 0x486C600
+add rsp,48h
+ret
+```
+
+### 0x486C600
+
+Core **`lua_load`**: `(L, reader, data, chunkname, mode)`.  
+Inject uses the **bufferx wrapper**, not this address directly.
+
+## Load → pcall (proven)
+
+Multiple probe sites:
+
+```
+call F0A0|F0E0
 test eax, eax
 jnz  fail
-… setup nargs …
-call lua_pcallk   ; 0x486C270
+call 0x486C270   ; lua_pcallk
 test eax, eax
 ```
 
-## 4. Xref `=(load)` (`0x68E7068`)
+## Signature (in-process, not packed file)
 
-- String present in probe anchors.
-- **No** RIP-relative code xref found inside pcall capture windows.
-- **Not verified.**
-
-## 5. Exact signature
-
-**Provisional pattern for F0A0:**
+Pattern for F0A0 (wildcards on RIP/E8 rel32):
 
 ```
-48 83 EC 48 48 8B 44 24 70 48 89 54 24 30 48 8D 15 ?? ?? ?? ?? 4C 89 44 24 38 4C 8D 44 24 30
+48 83 EC 48 48 8B 44 24 70 48 89 54 24 30 48 8D 15 ?? ?? ?? ??
+4C 89 44 24 38 4C 8D 44 24 30 48 89 44 24 20 E8 ?? ?? ?? ??
+48 83 C4 48 C3
 ```
 
-| Requirement | Status |
-|-------------|--------|
-| Unique match on full runtime `.text` | **UNKNOWN** |
-| Locked to SHA `0cfdfcc6…` | ready once unique |
+Enable rules (`src/hook/lua_signatures.h` build `wwm-lite-0cfdfcc6`):
 
-On-disk PE is **packed** (`RawSize=0`). Uniqueness **cannot** be proven without `--pid` while game runs (Admin) or an unpacked dump.
+1. File SHA-256 matches fingerprint (from disk path of module)  
+2. F0A0 pattern **matches == 1** in process image  
+3. pcall pattern **matches == 1**  
+4. First `E8` in F0A0 body targets `module_base + 0x486C600`  
 
-## 6. Why still not enabling runtime
+Fail closed otherwise.
 
-Need **all**:
+## Inject path
 
-1. SHA match — OK  
-2. `signature_matches == 1` on **runtime** image — **blocked**  
-3. pcall flow verified — **OK**  
-4. Full prototype / F0E0→F0A0 chain — **partial**  
-5. Optional `=(load)` xref — missing  
-
-Until (2) is green, inject stays off.
-
-## 7. How to finish (game running as Admin)
-
-```bat
-python Scripts/analyze_lua_loader.py ^
-  --module "C:\Program Files\wwm\wwm_lite\Engine\Binaries\Win64r\wwm.exe" ^
-  --probe captures\lua_signature_probe.json ^
-  --pid <wwm_pid> ^
-  --out captures\lua_loader_analysis.json ^
-  --report docs\C6_LUA_LOADER_ANALYSIS.md
-
-python Scripts/verify_lua_loader.py ^
-  --probe captures\lua_signature_probe.json ^
-  --out captures\lua_loader_verification.json
+```c
+rc = luaL_loadbufferx(L, script, len, "=(face_share_logger)", "t");
+if (rc != 0) { log; return; }  // no pcall, no retry spam
+rc = lua_pcallk_orig(L, 0, 0, 0, NULL, NULL);
 ```
 
-Need from live read (≥0x100 bytes at F0A0 and F0E0):
+Pending inject is cleared after first attempt (success or fail).
 
-- F0E0’s `call` target after strlen (must be F0A0 for loadstring chain)
-- F0A0’s inner `call` (parser / `lua_load`)
-- Unique pattern scan of full `.text` pages
+## External scan note
 
-Only then: build-specific `luaL_loadbufferx` adapter + CI artifact.
+`Scripts/scan_runtime_sigs.py` needs Admin `OpenProcess` (err 5 without elevation).  
+Uniqueness is enforced **inside** `GameHook.dll` after inject (same process — no OpenProcess).
 
 ## Safety
 

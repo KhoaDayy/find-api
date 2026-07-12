@@ -55,32 +55,46 @@ test('wrong SHA exits BUILD_FINGERPRINT_MISMATCH', () => {
   assert.ok(out.includes('BUILD_FINGERPRINT_MISMATCH'), out.slice(0, 500));
 });
 
-test('analysis report exists and does not enable runtime', () => {
+test('analysis report documents sibling wrappers and fail-closed uniqueness', () => {
   assert.ok(fs.existsSync(report));
   const md = fs.readFileSync(report, 'utf8');
   assert.ok(md.includes('0cfdfcc69d543af7428aac39f8bc3ea5db42563b84101b775ab710a6d050e8b1'));
   assert.ok(md.includes('0x486C270'));
   assert.ok(md.includes('0x486F0A0') || md.includes('486F0A0'));
-  assert.ok(/enabled:\s*\*\*NO\*\*/i.test(md) || md.includes('"enable_runtime": false') || md.includes('verified: false'));
+  assert.ok(md.includes('0x486C600') || md.includes('486C600'));
+  assert.ok(md.includes('siblings') || md.includes('sibling'));
   assert.ok(md.includes('UPLOAD_SCHEMA_VERIFIED'));
-  assert.ok(!md.includes('"verified": true'));
-  assert.ok(md.includes('pcall_flow_verified'));
+  assert.ok(md.includes('matches == 1') || md.includes('exactly 1'));
 });
 
-test('verify_lua_loader script exists', () => {
+test('verify_lua_loader and scan_runtime_sigs scripts exist', () => {
   assert.ok(fs.existsSync(path.join(root, 'Scripts', 'verify_lua_loader.py')));
+  assert.ok(fs.existsSync(path.join(root, 'Scripts', 'scan_runtime_sigs.py')));
 });
 
-test('analysis JSON has enable_runtime_hook false', () => {
+test('signature DB has wwm-lite fingerprint entry with loadbufferx', () => {
+  const hdr = fs.readFileSync(path.join(root, 'src/hook/lua_signatures.h'), 'utf8');
+  assert.ok(hdr.includes('wwm-lite-0cfdfcc6'));
+  assert.ok(hdr.includes('0cfdfcc69d543af7428aac39f8bc3ea5db42563b84101b775ab710a6d050e8b1'));
+  assert.ok(hdr.includes('kWwmLiteLoadBufferX'));
+  assert.ok(hdr.includes('0x486C600'));
+});
+
+test('runtime hook implements luaL_loadbufferx adapter path', () => {
+  const cpp = fs.readFileSync(path.join(root, 'src/hook/lua_runtime_hook.cpp'), 'utf8');
+  assert.ok(cpp.includes('luaL_loadbufferx_fn'));
+  assert.ok(cpp.includes('LuaLoaderKind::LuaLLoadBufferX'));
+  assert.ok(cpp.includes('INNER_LOADER_MISMATCH') || cpp.includes('inner'));
+  assert.ok(cpp.includes('loader rc=%d') || cpp.includes('loader rc='));
+});
+
+test('analysis JSON if present is structured', () => {
   if (!fs.existsSync(analysis)) {
     console.log('  skip analysis json missing');
     return;
   }
   const j = JSON.parse(fs.readFileSync(analysis, 'utf8'));
-  assert.strictEqual(j.conclusion.enable_runtime_hook, false);
-  if (j.conclusion.winner) {
-    assert.strictEqual(j.conclusion.winner.enable_runtime, false);
-  }
+  assert.ok(j.conclusion || j.enable_runtime !== undefined);
 });
 
 test('fuzzy never selected policy in report', () => {

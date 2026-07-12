@@ -20,7 +20,21 @@ enum class LuaLoaderKind : LONG {
   None = 0,
   LuaLoad = 1,
   LuaLLoadBufferX = 2,
+  LuaLLoadString = 3,
 };
+
+inline const char *LuaLoaderKindName(LuaLoaderKind k) {
+  switch (k) {
+  case LuaLoaderKind::LuaLoad:
+    return "lua_load";
+  case LuaLoaderKind::LuaLLoadBufferX:
+    return "luaL_loadbufferx";
+  case LuaLoaderKind::LuaLLoadString:
+    return "luaL_loadstring";
+  default:
+    return "none";
+  }
+}
 
 inline const char *LuaHookStateName(LuaHookState s) {
   switch (s) {

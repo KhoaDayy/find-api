@@ -20,6 +20,9 @@ typedef void *lua_State;
 typedef const char *(__cdecl *lua_Reader)(lua_State *L, void *ud, size_t *sz);
 typedef int(__cdecl *lua_load_fn)(lua_State *L, lua_Reader reader, void *data,
                                   const char *chunkname, const char *mode);
+// luaL_loadbufferx(L, buff, size, name, mode)
+typedef int(__cdecl *luaL_loadbufferx_fn)(lua_State *L, const char *buff, size_t sz,
+                                          const char *name, const char *mode);
 typedef int(__cdecl *lua_pcallk_fn)(lua_State *L, int nargs, int nresults, int msgh, void *ctx,
                                     void *k);
 
@@ -32,6 +35,7 @@ typedef struct {
 typedef BOOL(WINAPI *GetModuleInformation_t)(HANDLE, HMODULE, MY_MODULEINFO *, DWORD);
 
 lua_load_fn g_lua_load = nullptr;
+luaL_loadbufferx_fn g_lua_loadbufferx = nullptr;
 lua_pcallk_fn g_lua_pcallk_orig = nullptr;
 LuaLoaderKind g_loaderKind = LuaLoaderKind::None;
 
@@ -152,13 +156,16 @@ bool TryMarkInjected(lua_State *L) {
 }
 
 void InjectLuaScript(lua_State *L) {
-  if (!g_lua_load || !g_lua_pcallk_orig || !L)
+  const bool haveLoader =
+      (g_loaderKind == LuaLoaderKind::LuaLLoadBufferX && g_lua_loadbufferx) ||
+      (g_loaderKind == LuaLoaderKind::LuaLoad && g_lua_load);
+  if (!haveLoader || !g_lua_pcallk_orig || !L)
     return;
   if (StateAlreadyInjected(L))
     return;
 
   BootPrintf("lua_State observed %p", L);
-  BootPrintf("face_share_logger.lua load started");
+  BootPrintf("face_share_logger.lua load started kind=%s", LuaLoaderKindName(g_loaderKind));
 
   std::string script = ReadTextFile(g_scriptPath);
   if (script.empty()) {
@@ -185,12 +192,22 @@ void InjectLuaScript(lua_State *L) {
                          (g_cfg.capture_full_face_data ? "true" : "false") + "\n";
   std::string full = preamble + script;
 
-  LoadS ls{full.c_str(), full.size()};
-  BootPrintf("lua_load size=%zu L=%p", full.size(), L);
-  int rc = g_lua_load(L, lua_reader_cb, &ls, "=(face_share_logger)", "t");
-  BootPrintf("lua_load rc=%d", rc);
+  int rc = -1;
+  if (g_loaderKind == LuaLoaderKind::LuaLLoadBufferX && g_lua_loadbufferx) {
+    BootPrintf("loader luaL_loadbufferx size=%zu L=%p", full.size(), L);
+    rc = g_lua_loadbufferx(L, full.data(), full.size(), "=(face_share_logger)", "t");
+    BootPrintf("loader rc=%d", rc);
+  } else if (g_lua_load) {
+    LoadS ls{full.c_str(), full.size()};
+    BootPrintf("loader lua_load size=%zu L=%p", full.size(), L);
+    rc = g_lua_load(L, lua_reader_cb, &ls, "=(face_share_logger)", "t");
+    BootPrintf("loader rc=%d", rc);
+  }
   if (rc != 0) {
-    WriteCaptureEvent("native", "lua_load_failed", "{\"code\":" + std::to_string(rc) + "}");
+    WriteCaptureEvent("native", "lua_load_failed",
+                      "{\"code\":" + std::to_string(rc) + ",\"kind\":" +
+                          JsonString(LuaLoaderKindName(g_loaderKind)) + "}");
+    // Do not call pcall; do not retry-spam (pending already cleared by detour).
     return;
   }
   rc = g_lua_pcallk_orig(L, 0, 0, 0, nullptr, nullptr);
@@ -204,7 +221,9 @@ void InjectLuaScript(lua_State *L) {
     BootPrintf("[!] injected-state table full; script ran but not tracked");
   }
   SetHookState(LuaHookState::Injected);
-  WriteCaptureEvent("native", "lua_injected", "{\"script\":" + JsonString(g_scriptPath) + "}");
+  WriteCaptureEvent("native", "lua_injected",
+                    "{\"script\":" + JsonString(g_scriptPath) + ",\"kind\":" +
+                        JsonString(LuaLoaderKindName(g_loaderKind)) + "}");
   BootPrintf("face_share_logger.lua injected OK L=%p", L);
 }
 
@@ -226,9 +245,12 @@ int __cdecl Detour_lua_pcallk(lua_State *L, int nargs, int nresults, int msgh, v
   }
 
   // Inject only when installed/injected and pending arm set.
+  const bool haveLoader =
+      (g_loaderKind == LuaLoaderKind::LuaLLoadBufferX && g_lua_loadbufferx) ||
+      (g_loaderKind == LuaLoaderKind::LuaLoad && g_lua_load);
   if ((st == LuaHookState::Installed || st == LuaHookState::Injected) &&
       InterlockedCompareExchange(&g_pendingInject, 0, 0) != 0 && !g_insideLuaInjection && L &&
-      g_lua_load) {
+      haveLoader) {
     if (!StateAlreadyInjected(L)) {
       g_insideLuaInjection = true;
       // Clear pending after first attempt so spam does not re-enter forever on failure.
@@ -474,6 +496,7 @@ bool InstallLuaRuntimeHook(const HookConfig &cfg, const std::string &dllDir) {
   memset(g_injectedStates, 0, sizeof(g_injectedStates));
   ReleaseSRWLockExclusive(&g_stateLock);
   g_lua_load = nullptr;
+  g_lua_loadbufferx = nullptr;
   g_lua_pcallk_orig = nullptr;
   g_loaderKind = LuaLoaderKind::None;
 
@@ -528,82 +551,135 @@ bool InstallLuaRuntimeHook(const HookConfig &cfg, const std::string &dllDir) {
                           ",\"image_size\":" + std::to_string(m.size) + "}");
   }
 
-  // Patterns: config override, else DB entry matching sha256, else legacy.
+  // Patterns: fingerprint DB first (build-specific), else config/legacy.
   std::string sigLoad = cfg.sig_lua_load;
   std::string sigPcall = cfg.sig_lua_pcall;
   std::string sigLoadBuf = "";
+  unsigned expectInnerRva = 0;
+  const char *buildId = "legacy-default";
   for (int i = 0; i < kLuaSignatureBuildCount; i++) {
     const auto &b = kLuaSignatureBuilds[i];
     if (b.module_sha256 && b.module_sha256[0] && !fp.sha256.empty() &&
         fp.sha256 == b.module_sha256) {
+      buildId = b.id;
       if (b.sig_lua_load && b.sig_lua_load[0])
         sigLoad = b.sig_lua_load;
+      else
+        sigLoad.clear(); // do not fall back to wrong-build lua_load
       if (b.sig_lua_pcallk && b.sig_lua_pcallk[0])
         sigPcall = b.sig_lua_pcallk;
       if (b.sig_luaL_loadbufferx && b.sig_luaL_loadbufferx[0])
         sigLoadBuf = b.sig_luaL_loadbufferx;
+      expectInnerRva = b.inner_lua_load_rva;
       BootPrintf("signature DB match build=%s", b.id);
       break;
     }
   }
 
-  uintptr_t chosenLoad = 0;
+  uintptr_t chosenLoad = 0;       // classic lua_load if any
+  uintptr_t chosenLoadBufX = 0;   // luaL_loadbufferx
   uintptr_t chosenPcall = 0;
   std::string chosenModule;
   bool anyAmbiguous = false;
   bool sawPcall = false;
+  bool loadBufXUnique = false;
 
   for (const auto &m : candidates) {
-    auto loadHits = PatternScanAll(m.base, m.size, sigLoad.c_str());
-    auto pcallHits = PatternScanAll(m.base, m.size, sigPcall.c_str());
-    SigResult loadR = EvaluateSig(loadHits);
-    SigResult pcallR = EvaluateSig(pcallHits);
-
-    WriteCaptureEvent("native", "lua_scan_module",
-                      std::string("{\"name\":") + JsonString(m.name) + ",\"path\":" +
-                          JsonString(m.path) + ",\"size\":" + std::to_string(m.size) +
-                          ",\"lua_load_matches\":" + std::to_string(loadR.matches) +
-                          ",\"lua_pcall_matches\":" + std::to_string(pcallR.matches) + "}");
-    EmitSigEvent("lua_load", m.base, loadR);
-    EmitSigEvent("lua_pcallk", m.base, pcallR);
-
-    if (loadR.status[0] && strcmp(loadR.status, "SIGNATURE_AMBIGUOUS") == 0)
-      anyAmbiguous = true;
-    if (pcallR.status[0] && strcmp(pcallR.status, "SIGNATURE_AMBIGUOUS") == 0)
-      anyAmbiguous = true;
-    if (pcallR.selected)
-      sawPcall = true;
-
-    // Optional exact luaL_loadbufferx (never fuzzy).
-    if (!chosenLoad && !sigLoadBuf.empty()) {
-      auto lb = PatternScanAll(m.base, m.size, sigLoadBuf.c_str());
-      SigResult lbR = EvaluateSig(lb);
-      EmitSigEvent("luaL_loadbufferx", m.base, lbR);
-      if (lbR.status && strcmp(lbR.status, "ok") == 0 && pcallR.selected) {
-        // Not wired as g_lua_load yet — different ABI. Record only until explicit enable.
-        BootPrintf("luaL_loadbufferx exact at %s (not auto-enabled)",
-                   HexPtr(lbR.selected).c_str());
+    SigResult pcallR{};
+    if (!sigPcall.empty()) {
+      auto pcallHits = PatternScanAll(m.base, m.size, sigPcall.c_str());
+      pcallR = EvaluateSig(pcallHits);
+      EmitSigEvent("lua_pcallk", m.base, pcallR);
+      if (pcallR.status && strcmp(pcallR.status, "SIGNATURE_AMBIGUOUS") == 0)
+        anyAmbiguous = true;
+      if (pcallR.selected)
+        sawPcall = true;
+      if (pcallR.selected && !chosenPcall) {
+        chosenPcall = pcallR.selected;
+        chosenModule = m.name;
       }
     }
 
-    if (loadR.selected && pcallR.selected && !chosenLoad) {
-      chosenLoad = loadR.selected;
-      chosenPcall = pcallR.selected;
-      chosenModule = m.name;
-      g_loaderKind = LuaLoaderKind::LuaLoad;
+    SigResult loadR{};
+    if (!sigLoad.empty()) {
+      auto loadHits = PatternScanAll(m.base, m.size, sigLoad.c_str());
+      loadR = EvaluateSig(loadHits);
+      EmitSigEvent("lua_load", m.base, loadR);
+      if (loadR.status && strcmp(loadR.status, "SIGNATURE_AMBIGUOUS") == 0)
+        anyAmbiguous = true;
+      if (loadR.selected && pcallR.selected && !chosenLoad) {
+        chosenLoad = loadR.selected;
+        if (!chosenPcall)
+          chosenPcall = pcallR.selected;
+        chosenModule = m.name;
+      }
     }
-    if (!chosenPcall && pcallR.selected)
-      chosenPcall = pcallR.selected;
+
+    // Preferred: luaL_loadbufferx (build-specific). Require exact 1 match + inner call.
+    if (!sigLoadBuf.empty() && !chosenLoadBufX) {
+      auto lbHits = PatternScanAll(m.base, m.size, sigLoadBuf.c_str());
+      SigResult lbR = EvaluateSig(lbHits);
+      EmitSigEvent("luaL_loadbufferx", m.base, lbR);
+      BootPrintf("luaL_loadbufferx matches=%zu status=%s", lbR.matches, lbR.status);
+      WriteCaptureEvent(
+          "native", "luaL_loadbufferx_scan",
+          std::string("{\"module\":") + JsonString(m.name) +
+              ",\"matches\":" + std::to_string(lbR.matches) +
+              ",\"status\":" + JsonString(lbR.status) + "}");
+
+      if (lbR.status && strcmp(lbR.status, "SIGNATURE_AMBIGUOUS") == 0)
+        anyAmbiguous = true;
+
+      if (lbR.selected && pcallR.selected) {
+        bool innerOk = true;
+        if (expectInnerRva) {
+          // Find E8 in first 48 bytes of wrapper; must target module_base+expectInnerRva.
+          innerOk = false;
+          const uint8_t *p = (const uint8_t *)lbR.selected;
+          for (int off = 0; off + 5 <= 48; off++) {
+            if (p[off] != 0xE8)
+              continue;
+            int32_t rel = *(const int32_t *)(p + off + 1);
+            uintptr_t dest = lbR.selected + (uintptr_t)off + 5 + (intptr_t)rel;
+            uintptr_t expect = m.base + (uintptr_t)expectInnerRva;
+            BootPrintf("luaL_loadbufferx E8@+%d -> %s expect %s", off, HexPtr(dest).c_str(),
+                       HexPtr(expect).c_str());
+            if (dest == expect) {
+              innerOk = true;
+              break;
+            }
+          }
+        }
+        if (innerOk) {
+          chosenLoadBufX = lbR.selected;
+          chosenPcall = pcallR.selected;
+          chosenModule = m.name;
+          loadBufXUnique = (lbR.matches == 1);
+          BootPrintf("luaL_loadbufferx resolved %s (unique=%d)", HexPtr(chosenLoadBufX).c_str(),
+                     loadBufXUnique ? 1 : 0);
+        } else {
+          BootPrintf("[!] luaL_loadbufferx rejected: inner call != 0x%X", expectInnerRva);
+          WriteCaptureEvent("native", "lua_hook_error",
+                            "{\"error\":\"INNER_LOADER_MISMATCH\"}");
+        }
+      }
+    }
+
+    WriteCaptureEvent(
+        "native", "lua_scan_module",
+        std::string("{\"name\":") + JsonString(m.name) + ",\"path\":" + JsonString(m.path) +
+            ",\"size\":" + std::to_string(m.size) +
+            ",\"lua_load_matches\":" + std::to_string(loadR.matches) +
+            ",\"lua_pcall_matches\":" + std::to_string(pcallR.matches) +
+            ",\"loadbufferx\":" + (chosenLoadBufX ? "true" : "false") + "}");
   }
 
   // Always run diagnostic probe (fail-soft).
   {
     std::string probePath = ResolvePath(dllDir, cfg.capture_dir + "/lua_signature_probe.json");
-    // normalize slashes
     for (char &ch : probePath)
       if (ch == '/')
         ch = '\\';
-    // ensure dir
     char dir[MAX_PATH] = {};
     strncpy_s(dir, probePath.c_str(), _TRUNCATE);
     char *sl = strrchr(dir, '\\');
@@ -618,21 +694,26 @@ bool InstallLuaRuntimeHook(const HookConfig &cfg, const std::string &dllDir) {
       BootPrintf("[!] signature probe failed: %s", perr);
   }
 
-  if (!chosenLoad || !chosenPcall) {
+  // Prefer loadbufferx when unique + pcall OK.
+  const bool useLoadBufX = chosenLoadBufX && chosenPcall && loadBufXUnique;
+  const bool useClassic = chosenLoad && chosenPcall && !useLoadBufX;
+
+  if (!useLoadBufX && !useClassic) {
     if (anyAmbiguous)
       SetHookState(LuaHookState::SignatureAmbiguous);
     else
       SetHookState(LuaHookState::SignatureMissing);
 
-    BootPrintf("[!] Refusing full Lua inject: need exact unique lua_load + lua_pcallk");
-    WriteCaptureEvent("native", "lua_hook_error",
-                      std::string("{\"error\":\"") +
-                          (anyAmbiguous ? "SIGNATURE_AMBIGUOUS" : "SIGNATURE_NOT_FOUND") + "\"}");
+    BootPrintf("[!] Refusing full Lua inject: need unique loader + pcall (build=%s)", buildId);
+    WriteCaptureEvent(
+        "native", "lua_hook_error",
+        std::string("{\"error\":\"") +
+            (anyAmbiguous ? "SIGNATURE_AMBIGUOUS" : "SIGNATURE_NOT_FOUND") +
+            "\",\"build\":" + JsonString(buildId) + "}");
 
-    // Optional pcall-only observer.
     if (cfg.enable_pcall_observer_when_loader_missing && chosenPcall && sawPcall) {
       if (InstallPcallObserver((void *)chosenPcall))
-        return false; // not full capture installed
+        return false;
     }
     return false;
   }
@@ -643,11 +724,20 @@ bool InstallLuaRuntimeHook(const HookConfig &cfg, const std::string &dllDir) {
     return false;
   }
 
-  BootPrintf("lua_load resolved %s", HexPtr(chosenLoad).c_str());
+  if (useLoadBufX) {
+    g_loaderKind = LuaLoaderKind::LuaLLoadBufferX;
+    g_lua_loadbufferx = (luaL_loadbufferx_fn)chosenLoadBufX;
+    g_lua_load = nullptr;
+    BootPrintf("loader kind=luaL_loadbufferx %s", HexPtr(chosenLoadBufX).c_str());
+  } else {
+    g_loaderKind = LuaLoaderKind::LuaLoad;
+    g_lua_load = (lua_load_fn)chosenLoad;
+    g_lua_loadbufferx = nullptr;
+    BootPrintf("loader kind=lua_load %s", HexPtr(chosenLoad).c_str());
+  }
   BootPrintf("lua_pcallk resolved %s module=%s", HexPtr(chosenPcall).c_str(),
              chosenModule.c_str());
 
-  g_lua_load = (lua_load_fn)chosenLoad;
   void *pcallAddr = (void *)chosenPcall;
 
   MH_STATUS stCreate =
@@ -677,11 +767,16 @@ bool InstallLuaRuntimeHook(const HookConfig &cfg, const std::string &dllDir) {
   // Arm once so first pcall injects without requiring F5.
   InterlockedExchange(&g_pendingInject, 1);
 
-  WriteCaptureEvent("native", "lua_hook_installed",
-                    "{\"script\":" + JsonString(g_scriptPath) + ",\"module\":" +
-                        JsonString(chosenModule) + ",\"lua_load\":" + JsonString(HexPtr(chosenLoad)) +
-                        ",\"lua_pcallk\":" + JsonString(HexPtr(chosenPcall)) + "}");
-  BootPrintf("[+] Lua runtime hook installed; inject armed for next pcall");
+  WriteCaptureEvent(
+      "native", "lua_hook_installed",
+      std::string("{\"script\":") + JsonString(g_scriptPath) + ",\"module\":" +
+          JsonString(chosenModule) + ",\"build\":" + JsonString(buildId) +
+          ",\"loader_kind\":" + JsonString(LuaLoaderKindName(g_loaderKind)) +
+          ",\"loader\":" +
+          JsonString(HexPtr(useLoadBufX ? chosenLoadBufX : chosenLoad)) +
+          ",\"lua_pcallk\":" + JsonString(HexPtr(chosenPcall)) + "}");
+  BootPrintf("[+] Lua runtime hook installed kind=%s; inject armed for next pcall",
+             LuaLoaderKindName(g_loaderKind));
   return true;
 }
 
