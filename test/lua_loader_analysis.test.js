@@ -61,9 +61,14 @@ test('analysis report exists and does not enable runtime', () => {
   assert.ok(md.includes('0cfdfcc69d543af7428aac39f8bc3ea5db42563b84101b775ab710a6d050e8b1'));
   assert.ok(md.includes('0x486C270'));
   assert.ok(md.includes('0x486F0A0') || md.includes('486F0A0'));
-  assert.ok(md.includes('Runtime hook enabled:** **NO**') || md.includes('enabled:** **NO**') || /enabled:\s*\*\*NO\*\*/i.test(md) || md.includes('NO'));
+  assert.ok(/enabled:\s*\*\*NO\*\*/i.test(md) || md.includes('"enable_runtime": false') || md.includes('verified: false'));
   assert.ok(md.includes('UPLOAD_SCHEMA_VERIFIED'));
-  assert.ok(!md.includes('enable_runtime_hook: true'));
+  assert.ok(!md.includes('"verified": true'));
+  assert.ok(md.includes('pcall_flow_verified'));
+});
+
+test('verify_lua_loader script exists', () => {
+  assert.ok(fs.existsSync(path.join(root, 'Scripts', 'verify_lua_loader.py')));
 });
 
 test('analysis JSON has enable_runtime_hook false', () => {
