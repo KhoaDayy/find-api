@@ -2,6 +2,8 @@
 #include <Windows.h>
 #include <cstdio>
 #include <cstring>
+#include <io.h>
+#include <fcntl.h>
 #include <string>
 
 namespace face_capture {
@@ -88,6 +90,26 @@ std::string JsonString(const std::string &s) {
 std::string JsonNumber(long long n) { return std::to_string(n); }
 std::string JsonBool(bool b) { return b ? "true" : "false"; }
 
+// Open append with FILE_SHARE_READ so external tools can tail the log.
+static FILE *OpenCaptureFileShared(const char *path) {
+  HANDLE h = CreateFileA(path, FILE_APPEND_DATA,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE)
+    return nullptr;
+  int fd = _open_osfhandle((intptr_t)h, 0);
+  if (fd == -1) {
+    CloseHandle(h);
+    return nullptr;
+  }
+  FILE *f = _fdopen(fd, "ab");
+  if (!f) {
+    _close(fd);
+    return nullptr;
+  }
+  return f;
+}
+
 void InitCaptureWriter(const std::string &outputPath) {
   EnsureCs();
   EnterCriticalSection(&g_cs);
@@ -98,9 +120,7 @@ void InitCaptureWriter(const std::string &outputPath) {
       fclose(g_file);
       g_file = nullptr;
     }
-    // fopen_s is safer than fopen under odd CRT states.
-    if (fopen_s(&g_file, g_path.c_str(), "ab") != 0)
-      g_file = nullptr;
+    g_file = OpenCaptureFileShared(g_path.c_str());
     if (g_file) {
       fputs("{\"schema_version\":1,\"event\":\"capture_writer_open\",\"source\":\"native\"}\n",
             g_file);
@@ -115,6 +135,9 @@ void WriteCaptureEvent(const std::string &source, const std::string &event,
                        const std::string &region) {
   EnsureCs();
   EnterCriticalSection(&g_cs);
+  // Re-open per event if closed; keep share-read friendly handle.
+  if (!g_file && !g_path.empty())
+    g_file = OpenCaptureFileShared(g_path.c_str());
   if (g_file) {
     FILETIME ft{};
     GetSystemTimeAsFileTime(&ft);
@@ -124,8 +147,6 @@ void WriteCaptureEvent(const std::string &source, const std::string &event,
     long long ms =
         (long long)((uli.QuadPart - 116444736000000000ULL) / 10000ULL);
 
-    // Build line in a local buffer first so temporary JsonString objects die
-    // before fflush (helps if heap is noisy under inject).
     std::string line = "{\"schema_version\":1,\"timestamp_ms\":" +
                        std::to_string(ms) + ",\"source\":" + JsonString(source) +
                        ",\"event\":" + JsonString(event) +

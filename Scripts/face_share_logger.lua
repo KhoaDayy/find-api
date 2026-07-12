@@ -5,7 +5,7 @@
 -- No debug.sethook.
 ------------------------------------------------------------
 
-local LOGGER_VERSION = "1.3.0-reentry"
+local LOGGER_VERSION = "1.4.0-instance"
 
 if _G.__face_share_logger_v1 then
   print("[FACE_CAP_BOOT] logger_reentry")
@@ -50,6 +50,9 @@ local IMPORTANT = {
   rescan_complete = true,
   hook_discovery = true,
   hook_installed = true,
+  hook_install_failed = true,
+  object_probe = true,
+  method_probe = true,
   installer_done = true,
   installer_timeout = true,
   installer_no_timer = true,
@@ -251,6 +254,242 @@ end
 _G.__face_capture_emit = emit
 
 ------------------------------------------------------------
+-- Engine object helpers (table | instance | userdata | class)
+------------------------------------------------------------
+local TARGET_METHODS = {
+  "upload_plain_text_to_filepicker",
+  "_add_upload_task",
+  "_get_server_token",
+  "gen_server_token_back",
+  "_real_upload_file",
+  "http_fetch",
+  "rpc_gen_filepicker_token",
+  "rpc_server_filepicker_token",
+  "upload_face_data",
+  "share_face_data",
+  "on_click_share",
+  "do_share",
+  "upload_face_plan",
+  "create_face_plan",
+}
+
+local function runtime_type(v)
+  local ok, t = pcall(type, v)
+  return ok and t or "<type_error>"
+end
+
+local function is_indexable(v)
+  local t = runtime_type(v)
+  return t == "table" or t == "instance" or t == "userdata" or t == "class"
+end
+
+local function safe_get(obj, key)
+  if obj == nil then return false, nil, "nil_object" end
+  local ok, value = pcall(function()
+    return obj[key]
+  end)
+  return ok, value, ok and nil or tostring(value)
+end
+
+local function safe_set(obj, key, value)
+  if obj == nil then return false, "nil_object" end
+  local ok, err = pcall(function()
+    obj[key] = value
+  end)
+  return ok, ok and nil or tostring(err)
+end
+
+local function safe_tostring(v)
+  local ok, s = pcall(tostring, v)
+  if not ok then return "<tostring_error>" end
+  s = tostring(s)
+  if #s > 120 then s = s:sub(1, 120) .. "..." end
+  return s
+end
+
+local function probe_instance_writable(obj)
+  if not is_indexable(obj) then return false end
+  local key = "__face_cap_probe_" .. tostring(math.floor((os.clock() or 0) * 1e6) % 1000000)
+  local ok_get, orig = safe_get(obj, key)
+  if not ok_get then return false end
+  local ok_set = safe_set(obj, key, true)
+  if not ok_set then return false end
+  local ok_rb, rb = safe_get(obj, key)
+  pcall(function()
+    if orig == nil then
+      safe_set(obj, key, nil)
+    else
+      safe_set(obj, key, orig)
+    end
+  end)
+  return ok_rb and rb == true
+end
+
+local function filtered_keys(obj, maxn)
+  maxn = maxn or 150
+  local out = {}
+  if runtime_type(obj) ~= "table" then return out end
+  local n = 0
+  for k, v in pairs(obj) do
+    local ks = tostring(k):lower()
+    if ks:find("upload", 1, true) or ks:find("token", 1, true) or ks:find("file", 1, true)
+        or ks:find("picker", 1, true) or ks:find("share", 1, true) or ks:find("face", 1, true)
+        or ks:find("server", 1, true) or ks:find("manager", 1, true) or ks:find("class", 1, true)
+        or ks == "cls" or ks:find("instance", 1, true) or ks:find("get_instance", 1, true) then
+      out[#out + 1] = { key = tostring(k), type = runtime_type(v) }
+      n = n + 1
+      if n >= maxn then break end
+    end
+  end
+  return out
+end
+
+-- Discover where a method lives: instance / module / metatable.__index / class table
+local function resolve_method_owner(obj, name, object_path)
+  local result = {
+    object_path = object_path,
+    ["function"] = name,
+    found = false,
+    callable = false,
+    owner = nil,
+    owner_kind = nil,
+    owner_runtime_type = nil,
+  }
+  if not is_indexable(obj) then return result end
+
+  local ok, val = safe_get(obj, name)
+  if ok and runtime_type(val) == "function" then
+    result.found = true
+    result.callable = true
+    result.owner = obj
+    result.owner_kind = runtime_type(obj) == "table" and "module" or "instance"
+    result.owner_runtime_type = runtime_type(obj)
+    -- Prefer metatable.__index table if method also lives there
+    local okmt, mt = pcall(getmetatable, obj)
+    if okmt and runtime_type(mt) == "table" then
+      local oki, idx = safe_get(mt, "__index")
+      if oki and runtime_type(idx) == "table" then
+        local okm, mv = safe_get(idx, name)
+        if okm and runtime_type(mv) == "function" then
+          result.owner = idx
+          result.owner_kind = "metatable_index"
+          result.owner_runtime_type = "table"
+        end
+      end
+    end
+    return result
+  end
+
+  local okmt, mt = pcall(getmetatable, obj)
+  if okmt and runtime_type(mt) == "table" then
+    local oki, idx = safe_get(mt, "__index")
+    if oki and runtime_type(idx) == "table" then
+      local okm, mv = safe_get(idx, name)
+      if okm and runtime_type(mv) == "function" then
+        result.found = true
+        result.callable = true
+        result.owner = idx
+        result.owner_kind = "metatable_index"
+        result.owner_runtime_type = "table"
+        return result
+      end
+    end
+    local okm2, mv2 = safe_get(mt, name)
+    if okm2 and runtime_type(mv2) == "function" then
+      result.found = true
+      result.callable = true
+      result.owner = mt
+      result.owner_kind = "class_table"
+      result.owner_runtime_type = "table"
+      return result
+    end
+  end
+
+  -- class-ish fields on module tables
+  if runtime_type(obj) == "table" then
+    for _, ck in ipairs({ "FilePickerManager", "Manager", "Class", "cls", "class" }) do
+      local okc, cls = safe_get(obj, ck)
+      if okc and is_indexable(cls) then
+        local okm, mv = safe_get(cls, name)
+        if okm and runtime_type(mv) == "function" then
+          result.found = true
+          result.callable = true
+          result.owner = cls
+          result.owner_kind = "class_table"
+          result.owner_runtime_type = runtime_type(cls)
+          return result
+        end
+      end
+    end
+  end
+
+  return result
+end
+
+local function probe_object(obj, object_path)
+  local rt = runtime_type(obj)
+  local info = {
+    object_path = object_path,
+    runtime_type = rt,
+    tostring_safe = safe_tostring(obj),
+    metatable_type = "none",
+    index_type = "none",
+    instance_writable = false,
+    methods = {},
+    filtered_keys = {},
+  }
+  if not is_indexable(obj) then
+    emit("object_probe", info)
+    return info
+  end
+
+  local okmt, mt = pcall(getmetatable, obj)
+  if okmt and mt ~= nil then
+    info.metatable_type = runtime_type(mt)
+    if runtime_type(mt) == "table" then
+      local oki, idx = safe_get(mt, "__index")
+      if oki then info.index_type = runtime_type(idx) end
+    end
+  end
+
+  if rt == "instance" or rt == "userdata" then
+    info.instance_writable = probe_instance_writable(obj)
+  end
+
+  if runtime_type(obj) == "table" then
+    info.filtered_keys = filtered_keys(obj, 150)
+  elseif info.metatable_type == "table" and okmt then
+    local oki, idx = safe_get(mt, "__index")
+    if oki and runtime_type(idx) == "table" then
+      info.filtered_keys = filtered_keys(idx, 150)
+    end
+  end
+
+  for _, name in ipairs(TARGET_METHODS) do
+    local r = resolve_method_owner(obj, name, object_path)
+    info.methods[#info.methods + 1] = {
+      ["function"] = name,
+      found = r.found,
+      callable = r.callable,
+      owner_kind = r.owner_kind,
+      owner_runtime_type = r.owner_runtime_type,
+    }
+    if r.found then
+      emit("method_probe", {
+        object_path = object_path,
+        ["function"] = name,
+        callable = true,
+        owner_kind = r.owner_kind,
+        owner_runtime_type = r.owner_runtime_type,
+      })
+    end
+  end
+
+  emit("object_probe", info)
+  return info
+end
+
+------------------------------------------------------------
 -- Safe hook helper (preserve multi-return + mid nils)
 ------------------------------------------------------------
 local function already_hooked(fn)
@@ -261,33 +500,40 @@ local function mark_hooked(fn)
   hooked[fn] = true
 end
 
-local function report_discovery(object_path, fn_name, found, was_hooked)
+local function report_discovery(object_path, fn_name, found, was_hooked, extra)
   local key = tostring(object_path) .. "." .. tostring(fn_name)
-  if discovery_reported[key] and found then
-    -- still emit once more if we just hooked
-    if not was_hooked then return end
+  if discovery_reported[key] and found and not was_hooked then
+    return
   end
   discovery_reported[key] = true
-  emit("hook_discovery", {
+  local data = {
     object_path = object_path,
     ["function"] = fn_name,
     found = not not found,
     hooked = not not was_hooked,
-  })
+  }
+  if type(extra) == "table" then
+    for k, v in pairs(extra) do data[k] = v end
+  end
+  emit("hook_discovery", data)
 end
 
-local function wrap_fn(owner, name, object_path, before_fn, after_fn)
-  if type(owner) ~= "table" then
-    report_discovery(object_path or "?", name, false, false)
+-- Generalized: owner may be table/instance/userdata indexable.
+local function wrap_method(owner, name, object_path, owner_kind, before_fn, after_fn)
+  if not is_indexable(owner) then
+    report_discovery(object_path or "?", name, false, false, { owner_kind = owner_kind })
     return false
   end
-  local original = owner[name]
-  if type(original) ~= "function" then
-    report_discovery(object_path or "?", name, false, false)
+  local okg, original, gerr = safe_get(owner, name)
+  if not okg or runtime_type(original) ~= "function" then
+    report_discovery(object_path or "?", name, false, false, {
+      owner_kind = owner_kind,
+      get_error = gerr,
+    })
     return false
   end
   if already_hooked(original) then
-    report_discovery(object_path or "?", name, true, false)
+    report_discovery(object_path or "?", name, true, false, { owner_kind = owner_kind })
     return false
   end
 
@@ -297,28 +543,64 @@ local function wrap_fn(owner, name, object_path, before_fn, after_fn)
       local okb, errb = pcall(before_fn, ...)
       if not okb then print("[FACE_CAP] before err " .. tostring(errb)) end
     end
-
-    -- Call original exactly once; pack preserves mid-nil returns.
     local results = table.pack(original(...))
-
     if after_fn then
       local oka, erra = pcall(function()
         after_fn(true, table.unpack(results, 1, results.n))
       end)
       if not oka then print("[FACE_CAP] after err " .. tostring(erra)) end
     end
-
     return table.unpack(results, 1, results.n)
   end
 
-  -- Install without touching original identity bookkeeping incorrectly
-  owner[name] = wrapper
+  local oks, serr = safe_set(owner, name, wrapper)
+  if not oks then
+    emit("hook_install_failed", {
+      object_path = object_path,
+      ["function"] = name,
+      owner_kind = owner_kind,
+      error = serr,
+    })
+    return false
+  end
+
+  local okr, rb = safe_get(owner, name)
+  if not okr or rb ~= wrapper then
+    emit("hook_install_failed", {
+      object_path = object_path,
+      ["function"] = name,
+      owner_kind = owner_kind,
+      error = "readback_mismatch",
+    })
+    -- best-effort restore
+    pcall(function() safe_set(owner, name, original) end)
+    return false
+  end
+
   mark_hooked(original)
   mark_hooked(wrapper)
   installed_count = installed_count + 1
-  report_discovery(object_path or "?", name, true, true)
-  emit("hook_installed", { name = name, object_path = object_path })
+  report_discovery(object_path or "?", name, true, true, {
+    owner_kind = owner_kind,
+    owner_runtime_type = runtime_type(owner),
+  })
+  emit("hook_installed", {
+    name = name,
+    object_path = object_path,
+    ["function"] = name,
+    owner_kind = owner_kind,
+    owner_runtime_type = runtime_type(owner),
+  })
   return true
+end
+
+-- Back-compat alias used by older call sites
+local function wrap_fn(owner, name, object_path, before_fn, after_fn)
+  local r = resolve_method_owner(owner, name, object_path)
+  if r.found and r.owner then
+    return wrap_method(r.owner, name, object_path, r.owner_kind, before_fn, after_fn)
+  end
+  return wrap_method(owner, name, object_path, runtime_type(owner), before_fn, after_fn)
 end
 
 local function content_kind(content)
@@ -390,49 +672,70 @@ end
 -- Target hooks
 ------------------------------------------------------------
 local function try_hook_FaceShare(mod, object_path)
-  if type(mod) ~= "table" then return end
-  local ctl = mod.FaceShareController or mod
+  if not is_indexable(mod) then return 0 end
   local path = object_path or "FaceShareController"
-  if type(ctl) == "table" then
-    wrap_fn(ctl, "upload_face_data", path, function(self, ...)
-      share_seq = share_seq + 1
-      current_share_id = tostring(os.time()) .. "-" .. tostring(share_seq)
-      emit("face_share_enter", {
-        share_id = current_share_id,
-        has_face_data = self and self.face_data ~= nil,
-        has_guise_data = self and self.guise_data ~= nil,
-        face_data_summary = type(self and self.face_data) == "string" and summarize_content(self.face_data) or nil,
-      })
-      -- legacy alias event name
-      emit("face_share_start", { share_id = current_share_id })
-    end, function(ok, ...)
-      emit("face_share_end", { ok = ok })
-    end)
+  local okc, ctl = safe_get(mod, "FaceShareController")
+  if not (okc and is_indexable(ctl)) then ctl = mod end
+  local n = 0
+  for _, mname in ipairs({
+    "upload_face_data", "share_face_data", "on_click_share", "do_share",
+    "upload_face_plan", "create_face_plan",
+  }) do
+    local r = resolve_method_owner(ctl, mname, path)
+    if r.found and r.owner then
+      local ok = wrap_method(r.owner, mname, path, r.owner_kind, function(self, ...)
+        share_seq = share_seq + 1
+        current_share_id = tostring(os.time()) .. "-" .. tostring(share_seq)
+        local has_fd, has_gd = false, false
+        if is_indexable(self) then
+          local _, fd = safe_get(self, "face_data")
+          local _, gd = safe_get(self, "guise_data")
+          has_fd = fd ~= nil
+          has_gd = gd ~= nil
+        end
+        emit("face_share_enter", {
+          share_id = current_share_id,
+          method = mname,
+          has_face_data = has_fd,
+          has_guise_data = has_gd,
+        })
+        emit("face_share_start", { share_id = current_share_id, method = mname })
+      end, function(ok, ...)
+        emit("face_share_end", { ok = ok, method = mname })
+      end)
+      if ok then n = n + 1 end
+    end
   end
+  return n
 end
 
 local function install_upload_plain_wrapper(M, object_path)
-  if type(M) ~= "table" then return end
+  if not is_indexable(M) then return false end
   local name = "upload_plain_text_to_filepicker"
-  local original = M[name]
-  if type(original) ~= "function" then
+  local r = resolve_method_owner(M, name, object_path)
+  if not (r.found and r.owner) then
     report_discovery(object_path, name, false, false)
-    return
+    return false
   end
-  if already_hooked(original) or M.__face_cap_upload_wrap then
-    report_discovery(object_path, name, true, false)
-    return
+  local owner = r.owner
+  local okg, original = safe_get(owner, name)
+  if not okg or runtime_type(original) ~= "function" then
+    report_discovery(object_path, name, false, false)
+    return false
   end
-  M.__face_cap_upload_wrap = true
+  if already_hooked(original) then
+    report_discovery(object_path, name, true, false, { owner_kind = r.owner_kind })
+    return false
+  end
 
-  M[name] = function(self, content, callback, usage, from, expiresAfter, hex_fp_review_id, ...)
+  local wrapper = function(self, content, callback, usage, from, expiresAfter, hex_fp_review_id, ...)
     local sum = summarize_content(content)
     pcall(emit, "upload_plain_text_enter", {
       usage = usage,
       from = from,
       expiresAfter = expiresAfter,
       hex_fp_review_id = hex_fp_review_id,
-      callback_present = type(callback) == "function",
+      callback_present = runtime_type(callback) == "function",
       content = sum,
     })
     pcall(emit, "upload_plain_text", {
@@ -442,14 +745,19 @@ local function install_upload_plain_wrapper(M, object_path)
     })
 
     local cb = callback
-    if type(callback) == "function" then
+    if runtime_type(callback) == "function" then
       local orig_cb = callback
       cb = function(result, c2, detail, ...)
         local dkeys, pict, okey = {}, nil, nil
-        if type(detail) == "table" then
-          for k, _ in pairs(detail) do dkeys[#dkeys + 1] = tostring(k) end
-          pict = detail.pict_url or detail.url
-          if type(pict) == "string" then
+        if is_indexable(detail) then
+          -- shallow key list only for tables
+          if runtime_type(detail) == "table" then
+            for k, _ in pairs(detail) do dkeys[#dkeys + 1] = tostring(k) end
+          end
+          local _, p1 = safe_get(detail, "pict_url")
+          local _, p2 = safe_get(detail, "url")
+          pict = p1 or p2
+          if runtime_type(pict) == "string" then
             okey = pict:match("/file/([^%?%s]+)")
           end
         end
@@ -465,7 +773,7 @@ local function install_upload_plain_wrapper(M, object_path)
           pict_url = pict,
           object_key = okey,
         })
-        if type(pict) == "string" and #pict > 0 then
+        if runtime_type(pict) == "string" and #pict > 0 then
           pcall(emit, "pict_url_found", { pict_url = pict, object_key = okey })
         end
         return orig_cb(result, c2, detail, ...)
@@ -475,79 +783,136 @@ local function install_upload_plain_wrapper(M, object_path)
     return original(self, content, cb, usage, from, expiresAfter, hex_fp_review_id, ...)
   end
 
+  local oks = safe_set(owner, name, wrapper)
+  if not oks then
+    emit("hook_install_failed", {
+      object_path = object_path,
+      ["function"] = name,
+      owner_kind = r.owner_kind,
+      error = "assignment_failed",
+    })
+    return false
+  end
+  local okr, rb = safe_get(owner, name)
+  if not okr or rb ~= wrapper then
+    emit("hook_install_failed", {
+      object_path = object_path,
+      ["function"] = name,
+      owner_kind = r.owner_kind,
+      error = "readback_mismatch",
+    })
+    pcall(function() safe_set(owner, name, original) end)
+    return false
+  end
+
   mark_hooked(original)
-  mark_hooked(M[name])
+  mark_hooked(wrapper)
   installed_count = installed_count + 1
-  report_discovery(object_path, name, true, true)
+  report_discovery(object_path, name, true, true, {
+    owner_kind = r.owner_kind,
+    owner_runtime_type = r.owner_runtime_type,
+  })
+  emit("hook_installed", {
+    name = name,
+    object_path = object_path,
+    ["function"] = name,
+    owner_kind = r.owner_kind,
+    owner_runtime_type = r.owner_runtime_type,
+  })
+  return true
 end
 
 local function try_hook_FilePicker(mod, object_path)
-  if type(mod) ~= "table" then return end
-  local M = mod.FilePickerManager or mod
+  if not is_indexable(mod) then return 0 end
   local path = object_path or "filepicker_manager"
+  probe_object(mod, path)
 
-  install_upload_plain_wrapper(M, path)
+  local okm, M = safe_get(mod, "FilePickerManager")
+  if not (okm and is_indexable(M)) then M = mod end
+  if M ~= mod then probe_object(M, path .. ".FilePickerManager") end
 
-  wrap_fn(M, "_add_upload_task", path, function(self, task, usage, from, hex_fp_review_id, ...)
-    emit("add_upload_task", {
-      usage = usage,
-      from = from,
-      hex_fp_review_id = hex_fp_review_id,
-      task_type = type(task),
-    })
-  end)
+  local n = 0
+  if install_upload_plain_wrapper(M, path) then n = n + 1 end
+  -- also try on original mod (instance may hold methods via mt)
+  if M ~= mod and install_upload_plain_wrapper(mod, path) then n = n + 1 end
 
-  wrap_fn(M, "_get_server_token", path, function(self, usage, url, review, hex_fp_review_id)
-    emit("token_rpc_request", {
-      via = "_get_server_token",
-      usage = usage,
-      url = url,
-      review = review,
-      hex_fp_review_id = hex_fp_review_id,
-    })
-  end)
+  local function hook_one(owner, mname, before)
+    local r = resolve_method_owner(owner, mname, path)
+    if r.found and r.owner then
+      if wrap_method(r.owner, mname, path, r.owner_kind, before) then
+        n = n + 1
+      end
+    end
+  end
 
-  wrap_fn(M, "gen_server_token_back", path, function(self, server_token_with_tag, usage, url, review)
-    local tok = server_token_with_tag
-    local tagged = type(tok) == "string" and tok:sub(1, #FACE_TAG) == FACE_TAG
-    emit("token_rpc_response", {
-      via = "gen_server_token_back",
-      token_tagged = tagged,
-      token_prefix = tagged and FACE_TAG or nil,
-      token_length = type(tok) == "string" and #tok or 0,
-      token = type(tok) == "string" and (tagged and (FACE_TAG .. "***") or "***") or nil,
-      usage = usage,
-      url = url,
-      review = review,
-    })
-  end)
-
-  wrap_fn(M, "_real_upload_file", path, function(self, ...)
-    local post = nil
-    pcall(function()
-      post = self._fp_post_url or self.fp_post_url
+  for _, owner in ipairs({ M, mod }) do
+    hook_one(owner, "_add_upload_task", function(self, task, usage, from, hex_fp_review_id, ...)
+      emit("add_upload_task", {
+        usage = usage,
+        from = from,
+        hex_fp_review_id = hex_fp_review_id,
+        task_type = runtime_type(task),
+      })
     end)
-    emit("real_upload_enter", {
-      fp_post_url = post,
-      has_server_token = self and self._server_token ~= nil,
-      argc = select("#", ...),
-    })
-    emit("real_upload", {
-      fp_post_url = post,
-      has_server_token = self and self._server_token ~= nil,
-    })
-  end)
-
-  wrap_fn(M, "http_fetch", path, function(self, ...)
-    emit("http_fetch", { argc = select("#", ...) })
-  end)
+    hook_one(owner, "_get_server_token", function(self, usage, url, review, hex_fp_review_id)
+      emit("token_rpc_request", {
+        via = "_get_server_token",
+        usage = usage,
+        url = url,
+        review = review,
+        hex_fp_review_id = hex_fp_review_id,
+      })
+    end)
+    hook_one(owner, "gen_server_token_back", function(self, server_token_with_tag, usage, url, review)
+      local tok = server_token_with_tag
+      local tagged = runtime_type(tok) == "string" and tok:sub(1, #FACE_TAG) == FACE_TAG
+      emit("token_rpc_response", {
+        via = "gen_server_token_back",
+        token_tagged = tagged,
+        token_prefix = tagged and FACE_TAG or nil,
+        token_length = runtime_type(tok) == "string" and #tok or 0,
+        token = runtime_type(tok) == "string" and (tagged and (FACE_TAG .. "***") or "***") or nil,
+        usage = usage,
+        url = url,
+        review = review,
+      })
+    end)
+    hook_one(owner, "_real_upload_file", function(self, ...)
+      local post = nil
+      if is_indexable(self) then
+        local _, p1 = safe_get(self, "_fp_post_url")
+        local _, p2 = safe_get(self, "fp_post_url")
+        post = p1 or p2
+      end
+      local has_tok = false
+      if is_indexable(self) then
+        local _, t = safe_get(self, "_server_token")
+        has_tok = t ~= nil
+      end
+      emit("real_upload_enter", {
+        fp_post_url = post,
+        has_server_token = has_tok,
+        argc = select("#", ...),
+      })
+      emit("real_upload", {
+        fp_post_url = post,
+        has_server_token = has_tok,
+      })
+    end)
+    hook_one(owner, "http_fetch", function(self, ...)
+      emit("http_fetch", { argc = select("#", ...) })
+    end)
+  end
+  return n
 end
 
 local function try_hook_rpc_module(mod, modname)
-  if type(mod) ~= "table" then return end
+  if not is_indexable(mod) then return 0 end
   local path = modname or "rpc"
-  if type(mod.rpc_gen_filepicker_token) == "function" then
-    wrap_fn(mod, "rpc_gen_filepicker_token", path, function(self, params, usage, url, ...)
+  local n = 0
+  local r1 = resolve_method_owner(mod, "rpc_gen_filepicker_token", path)
+  if r1.found and r1.owner then
+    if wrap_method(r1.owner, "rpc_gen_filepicker_token", path, r1.owner_kind, function(self, params, usage, url, ...)
       emit("token_rpc_request", {
         via = "rpc_gen_filepicker_token",
         params = sanitize(params),
@@ -555,24 +920,19 @@ local function try_hook_rpc_module(mod, modname)
         url = url,
         module = modname,
       })
-      emit("rpc_gen_filepicker_token", {
-        params = sanitize(params),
-        usage = usage,
-        url = url,
-        module = modname,
-      })
-    end)
+    end) then n = n + 1 end
   else
     report_discovery(path, "rpc_gen_filepicker_token", false, false)
   end
-  if type(mod.rpc_server_filepicker_token) == "function" then
-    wrap_fn(mod, "rpc_server_filepicker_token", path, function(self, server_token, usage, url, review, ...)
-      local tagged = type(server_token) == "string" and server_token:sub(1, #FACE_TAG) == FACE_TAG
+  local r2 = resolve_method_owner(mod, "rpc_server_filepicker_token", path)
+  if r2.found and r2.owner then
+    if wrap_method(r2.owner, "rpc_server_filepicker_token", path, r2.owner_kind, function(self, server_token, usage, url, review, ...)
+      local tagged = runtime_type(server_token) == "string" and server_token:sub(1, #FACE_TAG) == FACE_TAG
       emit("token_rpc_response", {
         via = "rpc_server_filepicker_token",
         token_tagged = tagged,
         token_prefix = tagged and FACE_TAG or nil,
-        token_length = type(server_token) == "string" and #server_token or 0,
+        token_length = runtime_type(server_token) == "string" and #server_token or 0,
         usage = usage,
         url = url,
         review = review,
@@ -580,23 +940,26 @@ local function try_hook_rpc_module(mod, modname)
       })
       emit("rpc_server_filepicker_token", {
         token_tagged = tagged,
-        token_length = type(server_token) == "string" and #server_token or 0,
+        token_length = runtime_type(server_token) == "string" and #server_token or 0,
         usage = usage,
         url = url,
         module = modname,
       })
-    end)
+    end) then n = n + 1 end
   else
     report_discovery(path, "rpc_server_filepicker_token", false, false)
   end
+  return n
 end
 
--- Walk a dotted path on a root table (G.foo.bar)
+-- Walk a dotted path on a root table / indexable (G.foo.bar)
 local function resolve_path(root, dotted)
   local cur = root
   for part in string.gmatch(dotted, "[^%.]+") do
-    if type(cur) ~= "table" then return nil end
-    cur = cur[part]
+    if not is_indexable(cur) then return nil end
+    local ok, v = safe_get(cur, part)
+    if not ok then return nil end
+    cur = v
   end
   return cur
 end
@@ -630,25 +993,50 @@ local function list_candidate_modules(maxn)
   return names
 end
 
--- Idempotent: wrap_fn / already_hooked prevent double-wrap.
+-- Idempotent: wrap_method / already_hooked prevent double-wrap.
 local function scan_and_hook()
   local installed_before = installed_count
   local candidates_found = 0
+  local instance_candidates = 0
+  local module_candidates = 0
+  local class_candidates = 0
+  local callable_methods_found = 0
+  local writable_instances = 0
   local found_mods = {}
 
+  local function note_probe(info)
+    if not info then return end
+    local rt = info.runtime_type
+    if rt == "instance" or rt == "userdata" then
+      instance_candidates = instance_candidates + 1
+      if info.instance_writable then writable_instances = writable_instances + 1 end
+    elseif rt == "table" then
+      module_candidates = module_candidates + 1
+    elseif rt == "class" then
+      class_candidates = class_candidates + 1
+    end
+    for _, m in ipairs(info.methods or {}) do
+      if m.callable then callable_methods_found = callable_methods_found + 1 end
+    end
+  end
+
   for modname, mod in pairs(package.loaded or {}) do
-    if type(modname) == "string" and type(mod) == "table" then
+    if type(modname) == "string" and is_indexable(mod) then
       local mn = modname:lower()
-      if mn:find("face_share", 1, true) then
+      local face_share = mn:find("face", 1, true) and mn:find("share", 1, true)
+      local face_extra = mn:find("face_community", 1, true) or mn:find("face_make", 1, true)
+          or mn:find("face_create", 1, true)
+      if face_share or face_extra or mn:find("face_share", 1, true) then
         found_mods[#found_mods + 1] = modname
         candidates_found = candidates_found + 1
-        print("[FACE_CAP_BOOT] package.loaded face_share: " .. modname)
+        print("[FACE_CAP_BOOT] package.loaded face*: " .. modname .. " type=" .. runtime_type(mod))
+        note_probe(probe_object(mod, modname))
         try_hook_FaceShare(mod, modname)
       end
-      if mn:find("filepicker", 1, true) then
+      if mn:find("filepicker", 1, true) or mn:find("imp_filepicker", 1, true) then
         found_mods[#found_mods + 1] = modname
         candidates_found = candidates_found + 1
-        print("[FACE_CAP_BOOT] package.loaded filepicker: " .. modname)
+        print("[FACE_CAP_BOOT] package.loaded filepicker: " .. modname .. " type=" .. runtime_type(mod))
         try_hook_FilePicker(mod, modname)
         try_hook_rpc_module(mod, modname)
       end
@@ -656,38 +1044,33 @@ local function scan_and_hook()
   end
   print("[FACE_CAP_BOOT] package.loaded hits=" .. tostring(#found_mods))
 
-  local G_type = type(G)
+  local G_type = runtime_type(G)
   local fpm_type = "n/a"
   local ffpm_type = "n/a"
   print("[FACE_CAP_BOOT] G type=" .. G_type)
-  if type(G) == "table" then
-    fpm_type = type(G.filepicker_manager)
-    ffpm_type = type(G.face_filepicker_manager)
+  if is_indexable(G) then
+    local _, fpm = safe_get(G, "filepicker_manager")
+    local _, ffpm = safe_get(G, "face_filepicker_manager")
+    fpm_type = runtime_type(fpm)
+    ffpm_type = runtime_type(ffpm)
     print("[FACE_CAP_BOOT] G.filepicker_manager type=" .. fpm_type)
     print("[FACE_CAP_BOOT] G.face_filepicker_manager type=" .. ffpm_type)
-    print("[FACE_CAP_BOOT] G.ui_manager type=" .. type(G.ui_manager))
-    print("[FACE_CAP_BOOT] G.window_manager type=" .. type(G.window_manager))
-    if type(G.filepicker_manager) == "table" then
+    local _, uim = safe_get(G, "ui_manager")
+    local _, wim = safe_get(G, "window_manager")
+    print("[FACE_CAP_BOOT] G.ui_manager type=" .. runtime_type(uim))
+    print("[FACE_CAP_BOOT] G.window_manager type=" .. runtime_type(wim))
+
+    if is_indexable(fpm) then
       candidates_found = candidates_found + 1
-      try_hook_FilePicker(G.filepicker_manager, "G.filepicker_manager")
+      note_probe(probe_object(fpm, "G.filepicker_manager"))
+      try_hook_FilePicker(fpm, "G.filepicker_manager")
     else
       report_discovery("G.filepicker_manager", "*", false, false)
     end
-    if type(G.face_filepicker_manager) == "table" then
+    if is_indexable(ffpm) then
       candidates_found = candidates_found + 1
-      try_hook_FilePicker(G.face_filepicker_manager, "G.face_filepicker_manager")
-      wrap_fn(G.face_filepicker_manager, "gen_server_token_back", "G.face_filepicker_manager",
-        function(self, server_token, usage, url, review)
-          local tagged = type(server_token) == "string" and server_token:sub(1, #FACE_TAG) == FACE_TAG
-          emit("token_rpc_response", {
-            via = "face_filepicker_manager.gen_server_token_back",
-            token_tagged = tagged,
-            token_length = type(server_token) == "string" and #server_token or 0,
-            usage = usage,
-            url = url,
-            review = review,
-          })
-        end)
+      note_probe(probe_object(ffpm, "G.face_filepicker_manager"))
+      try_hook_FilePicker(ffpm, "G.face_filepicker_manager")
     else
       report_discovery("G.face_filepicker_manager", "*", false, false)
     end
@@ -699,8 +1082,8 @@ local function scan_and_hook()
     }
     for _, p in ipairs(paths) do
       local obj = resolve_path(G, p)
-      print("[FACE_CAP_BOOT] G." .. p .. " type=" .. type(obj))
-      if type(obj) == "table" and p:find("filepicker", 1, true) then
+      print("[FACE_CAP_BOOT] G." .. p .. " type=" .. runtime_type(obj))
+      if is_indexable(obj) and p:find("filepicker", 1, true) then
         candidates_found = candidates_found + 1
         try_hook_FilePicker(obj, "G." .. p)
       end
@@ -709,13 +1092,29 @@ local function scan_and_hook()
     report_discovery("G", "*", false, false)
   end
 
+  -- Known modules by exact name
+  for _, exact in ipairs({
+    "hexm.client.manager.filepicker.filepicker_manager",
+    "hexm.client.entities.server.player_avatar_members.imp_filepicker",
+  }) do
+    local mod = package.loaded and package.loaded[exact]
+    if is_indexable(mod) then
+      candidates_found = candidates_found + 1
+      print("[FACE_CAP_BOOT] exact module " .. exact .. " type=" .. runtime_type(mod))
+      note_probe(probe_object(mod, exact))
+      try_hook_FilePicker(mod, exact)
+      try_hook_rpc_module(mod, exact)
+    end
+  end
+
   local fsc = rawget(_G, "FaceShareController")
-  print("[FACE_CAP_BOOT] FaceShareController type=" .. type(fsc))
-  report_discovery("FaceShareController", "upload_face_data",
-    type(fsc) == "table" and type(fsc.upload_face_data) == "function", false)
-  if type(fsc) == "table" then
+  print("[FACE_CAP_BOOT] FaceShareController type=" .. runtime_type(fsc))
+  if is_indexable(fsc) then
     candidates_found = candidates_found + 1
+    note_probe(probe_object(fsc, "FaceShareController"))
     try_hook_FaceShare(fsc, "FaceShareController")
+  else
+    report_discovery("FaceShareController", "upload_face_data", false, false)
   end
 
   local installed_after = installed_count
@@ -724,11 +1123,16 @@ local function scan_and_hook()
     installed_after = installed_after,
     newly_installed = math.max(0, installed_after - installed_before),
     candidates_found = candidates_found,
+    instance_candidates = instance_candidates,
+    module_candidates = module_candidates,
+    class_candidates = class_candidates,
+    callable_methods_found = callable_methods_found,
+    writable_instances = writable_instances,
     package_loaded_count = count_package_loaded(),
     G_type = G_type,
     filepicker_manager_type = fpm_type,
     face_filepicker_manager_type = ffpm_type,
-    FaceShareController_type = type(fsc),
+    FaceShareController_type = runtime_type(fsc),
     candidate_modules = list_candidate_modules(50),
     writer_backend = WRITER_BACKEND,
     file_write_ok = FILE_WRITE_OK,
