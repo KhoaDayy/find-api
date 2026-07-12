@@ -72,3 +72,11 @@ guild_endpoint.txt
 club_cmd.txt
 club_out.txt
 wwm_copy.exe
+
+# vendored minhook: keep sources only
+lib/minhook/.git/
+lib/minhook/.github/
+lib/minhook/build/
+lib/minhook/cmake/
+lib/minhook/dll_resources/
+lib/minhook/CMakeLists.txt
