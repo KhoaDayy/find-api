@@ -5,15 +5,29 @@
 -- No debug.sethook.
 ------------------------------------------------------------
 
-local LOGGER_VERSION = "1.2.0-diag"
+local LOGGER_VERSION = "1.3.0-reentry"
 
 if _G.__face_share_logger_v1 then
-  print("[FACE_CAP] already loaded")
+  print("[FACE_CAP_BOOT] logger_reentry")
+  local rescan = rawget(_G, "__face_share_logger_rescan")
+  if type(rescan) == "function" then
+    local ok, err = pcall(rescan)
+    if type(_G.__face_capture_emit) == "function" then
+      pcall(_G.__face_capture_emit, "logger_reentry_rescan", {
+        ok = ok,
+        error = ok and nil or tostring(err),
+      })
+    else
+      print("[FACE_CAP_BOOT] logger_reentry_rescan ok=" .. tostring(ok) .. " err=" .. tostring(err))
+    end
+  else
+    print("[FACE_CAP_BOOT] logger_reentry no rescan function")
+  end
   return
 end
 _G.__face_share_logger_v1 = true
 
-local OUTPUT = _G.__FACE_CAPTURE_OUTPUT or "captures/face_share_capture.jsonl"
+local OUTPUT = _G.__FACE_CAPTURE_OUTPUT or "captures/face_share_capture_lua.jsonl"
 local CAPTURE_FULL = _G.__FACE_CAPTURE_FULL == true
 local WRITER_BACKEND = "file" -- flipped to console_only if io missing
 local FILE_WRITE_OK = false
@@ -30,6 +44,10 @@ local discovery_reported = {} -- [path] = true
 local IMPORTANT = {
   logger_loaded = true,
   logger_start = true,
+  logger_reentry = true,
+  logger_reentry_rescan = true,
+  rescan_start = true,
+  rescan_complete = true,
   hook_discovery = true,
   hook_installed = true,
   installer_done = true,
@@ -229,6 +247,8 @@ local function emit(event, data)
     print("[FACE_CAP] " .. tostring(event))
   end
 end
+
+_G.__face_capture_emit = emit
 
 ------------------------------------------------------------
 -- Safe hook helper (preserve multi-return + mid nils)
@@ -581,18 +601,53 @@ local function resolve_path(root, dotted)
   return cur
 end
 
-local function scan_and_hook()
-  local found_mods = {}
+local function count_package_loaded()
+  local n = 0
+  if type(package) == "table" and type(package.loaded) == "table" then
+    for _ in pairs(package.loaded) do
+      n = n + 1
+    end
+  end
+  return n
+end
+
+local function list_candidate_modules(maxn)
+  maxn = maxn or 50
+  local names = {}
+  if type(package) ~= "table" or type(package.loaded) ~= "table" then
+    return names
+  end
   for modname, mod in pairs(package.loaded) do
+    if type(modname) == "string" then
+      local mn = modname:lower()
+      if mn:find("face", 1, true) or mn:find("filepicker", 1, true)
+          or mn:find("picker", 1, true) or mn:find("upload", 1, true) then
+        names[#names + 1] = { name = modname, type = type(mod) }
+        if #names >= maxn then break end
+      end
+    end
+  end
+  return names
+end
+
+-- Idempotent: wrap_fn / already_hooked prevent double-wrap.
+local function scan_and_hook()
+  local installed_before = installed_count
+  local candidates_found = 0
+  local found_mods = {}
+
+  for modname, mod in pairs(package.loaded or {}) do
     if type(modname) == "string" and type(mod) == "table" then
       local mn = modname:lower()
       if mn:find("face_share", 1, true) then
         found_mods[#found_mods + 1] = modname
+        candidates_found = candidates_found + 1
         print("[FACE_CAP_BOOT] package.loaded face_share: " .. modname)
         try_hook_FaceShare(mod, modname)
       end
       if mn:find("filepicker", 1, true) then
         found_mods[#found_mods + 1] = modname
+        candidates_found = candidates_found + 1
         print("[FACE_CAP_BOOT] package.loaded filepicker: " .. modname)
         try_hook_FilePicker(mod, modname)
         try_hook_rpc_module(mod, modname)
@@ -601,16 +656,25 @@ local function scan_and_hook()
   end
   print("[FACE_CAP_BOOT] package.loaded hits=" .. tostring(#found_mods))
 
-  print("[FACE_CAP_BOOT] G type=" .. type(G))
+  local G_type = type(G)
+  local fpm_type = "n/a"
+  local ffpm_type = "n/a"
+  print("[FACE_CAP_BOOT] G type=" .. G_type)
   if type(G) == "table" then
-    print("[FACE_CAP_BOOT] G.filepicker_manager type=" .. type(G.filepicker_manager))
-    print("[FACE_CAP_BOOT] G.face_filepicker_manager type=" .. type(G.face_filepicker_manager))
+    fpm_type = type(G.filepicker_manager)
+    ffpm_type = type(G.face_filepicker_manager)
+    print("[FACE_CAP_BOOT] G.filepicker_manager type=" .. fpm_type)
+    print("[FACE_CAP_BOOT] G.face_filepicker_manager type=" .. ffpm_type)
+    print("[FACE_CAP_BOOT] G.ui_manager type=" .. type(G.ui_manager))
+    print("[FACE_CAP_BOOT] G.window_manager type=" .. type(G.window_manager))
     if type(G.filepicker_manager) == "table" then
+      candidates_found = candidates_found + 1
       try_hook_FilePicker(G.filepicker_manager, "G.filepicker_manager")
     else
       report_discovery("G.filepicker_manager", "*", false, false)
     end
     if type(G.face_filepicker_manager) == "table" then
+      candidates_found = candidates_found + 1
       try_hook_FilePicker(G.face_filepicker_manager, "G.face_filepicker_manager")
       wrap_fn(G.face_filepicker_manager, "gen_server_token_back", "G.face_filepicker_manager",
         function(self, server_token, usage, url, review)
@@ -637,6 +701,7 @@ local function scan_and_hook()
       local obj = resolve_path(G, p)
       print("[FACE_CAP_BOOT] G." .. p .. " type=" .. type(obj))
       if type(obj) == "table" and p:find("filepicker", 1, true) then
+        candidates_found = candidates_found + 1
         try_hook_FilePicker(obj, "G." .. p)
       end
     end
@@ -644,15 +709,65 @@ local function scan_and_hook()
     report_discovery("G", "*", false, false)
   end
 
-  -- FaceShareController on globals / package
+  local fsc = rawget(_G, "FaceShareController")
+  print("[FACE_CAP_BOOT] FaceShareController type=" .. type(fsc))
   report_discovery("FaceShareController", "upload_face_data",
-    type(rawget(_G, "FaceShareController")) == "table"
-      and type((rawget(_G, "FaceShareController") or {}).upload_face_data) == "function",
-    false)
+    type(fsc) == "table" and type(fsc.upload_face_data) == "function", false)
+  if type(fsc) == "table" then
+    candidates_found = candidates_found + 1
+    try_hook_FaceShare(fsc, "FaceShareController")
+  end
+
+  local installed_after = installed_count
+  return {
+    installed_before = installed_before,
+    installed_after = installed_after,
+    newly_installed = math.max(0, installed_after - installed_before),
+    candidates_found = candidates_found,
+    package_loaded_count = count_package_loaded(),
+    G_type = G_type,
+    filepicker_manager_type = fpm_type,
+    face_filepicker_manager_type = ffpm_type,
+    FaceShareController_type = type(fsc),
+    candidate_modules = list_candidate_modules(50),
+    writer_backend = WRITER_BACKEND,
+    file_write_ok = FILE_WRITE_OK,
+  }
 end
 
 local function important_hooked()
   return installed_count >= 1
+end
+
+local function do_rescan(reason)
+  reason = reason or "manual"
+  emit("rescan_start", {
+    reason = reason,
+    installed_count = installed_count,
+    package_loaded_count = count_package_loaded(),
+    G_type = type(G),
+  })
+  local ok, result = pcall(scan_and_hook)
+  if not ok then
+    emit("rescan_complete", {
+      ok = false,
+      error = tostring(result),
+      reason = reason,
+      installed_before = installed_count,
+      installed_after = installed_count,
+      newly_installed = 0,
+    })
+    return nil
+  end
+  result = result or {}
+  result.ok = true
+  result.reason = reason
+  emit("rescan_complete", result)
+  return result
+end
+
+_G.__face_share_logger_rescan = function()
+  return do_rescan("global")
 end
 
 ------------------------------------------------------------
@@ -691,6 +806,8 @@ emit("logger_loaded", {
   writer_backend = WRITER_BACKEND,
   io_type = type(io),
   io_open_type = type(io) == "table" and type(io.open) or "n/a",
+  absolute_output = tostring(OUTPUT):match("^[A-Za-z]:\\") ~= nil
+    or tostring(OUTPUT):sub(1, 1) == "/",
 })
 emit("logger_start", {
   output = OUTPUT,
@@ -707,17 +824,18 @@ local function installer()
       writer_backend = WRITER_BACKEND,
       file_write_ok = FILE_WRITE_OK,
       file_write_err = FILE_WRITE_ERR,
+      rescan_required = not important_hooked(),
     })
     return
   end
-  pcall(scan_and_hook)
+  do_rescan("installer")
   if important_hooked() and installed_count >= 3 then
     emit("installer_done", {
       installed_count = installed_count,
       writer_backend = WRITER_BACKEND,
       file_write_ok = FILE_WRITE_OK,
+      rescan_required = false,
     })
-    _G.__face_share_logger_rescan = scan_and_hook
     return
   end
 
@@ -731,13 +849,13 @@ local function installer()
   if not scheduled then
     emit("installer_no_timer", {
       installed_count = installed_count,
-      note = "call __face_share_logger_rescan() or F5 reinject",
+      rescan_required = true,
+      note = "F5 reinject will call __face_share_logger_rescan",
     })
   end
-  _G.__face_share_logger_rescan = scan_and_hook
 end
 
 installer()
-print("[FACE_CAP_BOOT] face_share_logger " .. LOGGER_VERSION .. " loaded; scanning package.loaded")
-print("[FACE_CAP_BOOT] call __face_share_logger_rescan() or F5 reinject to rescan modules")
+print("[FACE_CAP_BOOT] face_share_logger " .. LOGGER_VERSION .. " loaded")
+print("[FACE_CAP_BOOT] F5 reinject triggers reentry rescan")
 print("[FACE_CAP_BOOT] file_write_ok=" .. tostring(FILE_WRITE_OK) .. " err=" .. tostring(FILE_WRITE_ERR))

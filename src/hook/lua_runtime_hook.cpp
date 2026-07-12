@@ -161,8 +161,8 @@ void InjectLuaScript(lua_State *L) {
       (g_loaderKind == LuaLoaderKind::LuaLoad && g_lua_load);
   if (!haveLoader || !g_lua_pcallk_orig || !L)
     return;
-  if (StateAlreadyInjected(L))
-    return;
+  // Allow re-run when F5 arms pending again so script reentry can rescan.
+  // (Do not early-return on StateAlreadyInjected.)
 
   BootPrintf("lua_State observed %p", L);
   BootPrintf("face_share_logger.lua load started kind=%s", LuaLoaderKindName(g_loaderKind));
@@ -175,22 +175,28 @@ void InjectLuaScript(lua_State *L) {
     return;
   }
 
-  std::string outPath = ResolveCaptureOutputPath(g_dllDir, g_cfg);
-  std::string outEsc;
-  for (char c : outPath) {
-    if (c == '\\')
-      outEsc += "\\\\";
-    else if (c == '"')
-      outEsc += "\\\"";
-    else
-      outEsc += c;
+  // Separate absolute Lua JSONL (avoid contention with native capture file).
+  std::string luaOut = g_dllDir + "captures\\face_share_capture_lua.jsonl";
+  {
+    std::string capDir = g_dllDir + "captures";
+    CreateDirectoryA(capDir.c_str(), nullptr);
   }
+  BootPrintf("lua_output_path=%s", luaOut.c_str());
+  WriteCaptureEvent("native", "lua_output_configured",
+                    std::string("{\"path\":") + JsonString(luaOut) +
+                        ",\"absolute\":true}");
 
-  std::string preamble = std::string("-- face_share_logger injected\n") +
-                         "_G.__FACE_CAPTURE_OUTPUT = \"" + outEsc + "\"\n" +
-                         "_G.__FACE_CAPTURE_FULL = " +
-                         (g_cfg.capture_full_face_data ? "true" : "false") + "\n";
+  // Long-bracket path: safe, no escape issues for Windows paths.
+  // Bump '=' count if path ever contains closing delimiter (unlikely).
+  std::string eq = "==";
+  if (luaOut.find("]==]") != std::string::npos)
+    eq = "===";
+  std::string preamble =
+      std::string("-- face_share_logger bootstrap\n") + "_G.__FACE_CAPTURE_OUTPUT = [" + eq +
+      "[" + luaOut + "]" + eq + "]\n" + "_G.__FACE_CAPTURE_FULL = " +
+      (g_cfg.capture_full_face_data ? "true" : "false") + "\n";
   std::string full = preamble + script;
+  BootPrintf("lua_bootstrap_bytes=%zu", full.size());
 
   int rc = -1;
   if (g_loaderKind == LuaLoaderKind::LuaLLoadBufferX && g_lua_loadbufferx) {
@@ -218,12 +224,13 @@ void InjectLuaScript(lua_State *L) {
   }
 
   if (!TryMarkInjected(L)) {
-    BootPrintf("[!] injected-state table full; script ran but not tracked");
+    BootPrintf("[!] injected-state table full; script ran (reentry/rescan ok)");
   }
   SetHookState(LuaHookState::Injected);
   WriteCaptureEvent("native", "lua_injected",
                     "{\"script\":" + JsonString(g_scriptPath) + ",\"kind\":" +
-                        JsonString(LuaLoaderKindName(g_loaderKind)) + "}");
+                        JsonString(LuaLoaderKindName(g_loaderKind)) +
+                        ",\"lua_output\":" + JsonString(luaOut) + "}");
   BootPrintf("face_share_logger.lua injected OK L=%p", L);
 }
 
