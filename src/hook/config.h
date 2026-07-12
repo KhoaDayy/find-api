@@ -27,6 +27,8 @@ struct HookConfig {
   bool enable_pcall_observer_when_loader_missing = false;
   // AllocConsole + redirect stdout/stderr (also set by GAMEHOOK_CONSOLE=1).
   bool enable_console = true;
+  // One-shot CN→Global face conversion via game's own Share upload (F6 arms).
+  bool enable_cn_to_global_conversion = false;
 
   bool capture_only_filepicker = true;
   bool redact_secrets = true;

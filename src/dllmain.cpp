@@ -284,6 +284,16 @@ static int Step_RequestLua() {
   return 0;
 }
 
+static int Step_RequestCnToGlobal() {
+  char reason[160] = {};
+  if (RequestCnToGlobalArm(reason, sizeof(reason))) {
+    ConPrint("F6 CN→Global arm requested (Share once after next inject)");
+  } else {
+    ConPrint("F6 ignored: %s", reason[0] ? reason : "CN_TO_GLOBAL_DISABLED");
+  }
+  return 0;
+}
+
 // --- SEH gates: no C++ objects with destructors ---
 
 static int SehCall(const char *name, int (*fn)()) {
@@ -356,8 +366,11 @@ static DWORD WINAPI InitThread(LPVOID) {
 
   {
     LuaHookState st = GetLuaHookState();
-    if (st == LuaHookState::Installed || st == LuaHookState::Injected)
+    if (st == LuaHookState::Installed || st == LuaHookState::Injected) {
       ConPrint("[*] Init complete: Lua hook installed. Press F5 to arm injection.");
+      if (g_cfg.enable_cn_to_global_conversion)
+        ConPrint("[*] CN→Global conversion ON: prepare pending file, F6 arm, Share once.");
+    }
     else if (st == LuaHookState::SignatureMissing)
       ConPrint("[*] Init complete: Lua capture unavailable — lua_load signature missing. "
                "Do not press F5. See captures/lua_signature_probe.json");
@@ -376,6 +389,9 @@ static DWORD WINAPI InitThread(LPVOID) {
       // Direct call — RequestLuaInject is atomic and must not AV.
       // Still wrap in SEH for defense in depth.
       RunStep("request_lua", Step_RequestLua);
+    }
+    if (GetAsyncKeyState(VK_F6) & 1) {
+      RunStep("request_cn_to_global", Step_RequestCnToGlobal);
     }
     Sleep(100);
   }

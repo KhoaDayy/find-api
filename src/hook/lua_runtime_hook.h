@@ -13,6 +13,10 @@ void UninstallLuaRuntimeHook();
 // reason: optional ASCII buffer for boot log.
 bool RequestLuaInject(char *reason = nullptr, size_t reasonN = 0);
 
+// F6: arm one-shot CN→Global conversion + reinject so Lua can load pending file.
+// Requires enable_cn_to_global_conversion and installed Lua hook.
+bool RequestCnToGlobalArm(char *reason = nullptr, size_t reasonN = 0);
+
 LuaHookState GetLuaHookState();
 const char *GetLuaHookStateName();
 

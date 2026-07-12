@@ -74,6 +74,7 @@ test('default config is Lua-first, winhttp off, no debug sethook, no pcall obser
   assert.strictEqual(exampleCfg.enable_lua_debug_hook, false);
   assert.strictEqual(exampleCfg.enable_pcall_observer_when_loader_missing, false);
   assert.strictEqual(exampleCfg.enable_console, true);
+  assert.strictEqual(exampleCfg.enable_cn_to_global_conversion, false);
   assert.ok(Array.isArray(exampleCfg.target_processes));
   assert.ok(exampleCfg.target_processes.includes('wwm.exe'));
   assert.ok(exampleCfg.lua_script.includes('face_share_logger'));

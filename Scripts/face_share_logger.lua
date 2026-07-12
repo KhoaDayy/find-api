@@ -9,6 +9,14 @@ local LOGGER_VERSION = "1.4.0-instance"
 
 if _G.__face_share_logger_v1 then
   print("[FACE_CAP_BOOT] logger_reentry")
+  -- F6 arm may be set on this inject cycle even when logger already loaded.
+  if _G.__FACE_CAPTURE_ARM_CN_GLOBAL == true then
+    local arm = rawget(_G, "__face_capture_arm_cn_global")
+    if type(arm) == "function" then
+      pcall(arm)
+    end
+    _G.__FACE_CAPTURE_ARM_CN_GLOBAL = false
+  end
   local rescan = rawget(_G, "__face_share_logger_rescan")
   if type(rescan) == "function" then
     local ok, err = pcall(rescan)
@@ -67,6 +75,11 @@ local IMPORTANT = {
   upload_callback = true,
   filepicker_callback = true,
   pict_url_found = true,
+  cn_to_global_armed = true,
+  cn_to_global_intercepted = true,
+  cn_to_global_result = true,
+  cn_to_global_rejected = true,
+  cn_to_global_expired = true,
 }
 
 ------------------------------------------------------------
@@ -252,6 +265,329 @@ local function emit(event, data)
 end
 
 _G.__face_capture_emit = emit
+
+------------------------------------------------------------
+-- CN → Global one-shot conversion (game Share path only)
+------------------------------------------------------------
+local PENDING_PATH = _G.__FACE_CAPTURE_PENDING_PATH
+    or "captures/pending_cn_to_global.json"
+local RESULT_PATH = _G.__FACE_CAPTURE_RESULT_PATH
+    or "captures/cn_to_global_result.json"
+local CN_TO_GLOBAL_FEATURE = _G.__FACE_CAPTURE_CN_TO_GLOBAL_ENABLED == true
+local pending_conv = nil -- { face_data, dressing, source_object_key, face_data_hash, face_data_length, expires_at }
+
+local function write_json_file(path, obj)
+  if type(io) ~= "table" or type(io.open) ~= "function" then
+    return false, "io_unavailable"
+  end
+  local ok, err = pcall(function()
+    local f = assert(io.open(path, "w"))
+    f:write(encode(obj))
+    f:write("\n")
+    f:close()
+  end)
+  return ok, err
+end
+
+local function read_text_file(path)
+  if type(io) ~= "table" or type(io.open) ~= "function" then
+    return nil, "io_unavailable"
+  end
+  local f, err = io.open(path, "r")
+  if not f then return nil, tostring(err) end
+  local data = f:read("*a")
+  f:close()
+  return data, nil
+end
+
+-- Minimal JSON decode for object with string/number/bool/null/array/object (no unicode escapes needed).
+local function json_decode(str)
+  if type(str) ~= "string" then return nil, "not_string" end
+  local i = 1
+  local function skip()
+    while true do
+      local c = str:sub(i, i)
+      if c == " " or c == "\n" or c == "\r" or c == "\t" then i = i + 1 else break end
+    end
+  end
+  local parse_value
+  local function parse_string()
+    i = i + 1
+    local out = {}
+    while i <= #str do
+      local c = str:sub(i, i)
+      if c == '"' then i = i + 1; return table.concat(out) end
+      if c == "\\" then
+        local n = str:sub(i + 1, i + 1)
+        local map = { ['"'] = '"', ["\\"] = "\\", ["/"] = "/", b = "\b", f = "\f", n = "\n", r = "\r", t = "\t" }
+        if n == "u" then
+          out[#out + 1] = "?"
+          i = i + 6
+        else
+          out[#out + 1] = map[n] or n
+          i = i + 2
+        end
+      else
+        out[#out + 1] = c
+        i = i + 1
+      end
+    end
+    return nil
+  end
+  local function parse_number()
+    local j = str:match("^-?%d+%.?%d*[eE]?[+-]?%d*", i) or str:match("^-?%d+", i)
+    if not j then return nil end
+    i = i + #j
+    return tonumber(j)
+  end
+  local function parse_array()
+    i = i + 1
+    local arr = {}
+    skip()
+    if str:sub(i, i) == "]" then i = i + 1; return arr end
+    while true do
+      local v = parse_value()
+      arr[#arr + 1] = v
+      skip()
+      local c = str:sub(i, i)
+      if c == "]" then i = i + 1; return arr end
+      if c ~= "," then return nil end
+      i = i + 1
+      skip()
+    end
+  end
+  local function parse_object()
+    i = i + 1
+    local obj = {}
+    skip()
+    if str:sub(i, i) == "}" then i = i + 1; return obj end
+    while true do
+      skip()
+      if str:sub(i, i) ~= '"' then return nil end
+      local k = parse_string()
+      if not k then return nil end
+      skip()
+      if str:sub(i, i) ~= ":" then return nil end
+      i = i + 1
+      skip()
+      local v = parse_value()
+      obj[k] = v
+      skip()
+      local c = str:sub(i, i)
+      if c == "}" then i = i + 1; return obj end
+      if c ~= "," then return nil end
+      i = i + 1
+    end
+  end
+  parse_value = function()
+    skip()
+    local c = str:sub(i, i)
+    if c == '"' then return parse_string() end
+    if c == "{" then return parse_object() end
+    if c == "[" then return parse_array() end
+    if c == "t" and str:sub(i, i + 3) == "true" then i = i + 4; return true end
+    if c == "f" and str:sub(i, i + 4) == "false" then i = i + 5; return false end
+    if c == "n" and str:sub(i, i + 3) == "null" then i = i + 4; return nil end
+    if c == "-" or c:match("%d") then return parse_number() end
+    return nil
+  end
+  local ok, val = pcall(parse_value)
+  if not ok then return nil, tostring(val) end
+  return val, nil
+end
+
+local function json_encode_object(obj)
+  -- Reuse encode(); it handles tables.
+  return encode(obj)
+end
+
+local function clear_pending(reason)
+  pending_conv = nil
+  if reason then
+    print("[FACE_CAP_BOOT] pending cleared: " .. tostring(reason))
+  end
+end
+
+local function arm_cn_to_global_from_file()
+  if not CN_TO_GLOBAL_FEATURE then
+    emit("cn_to_global_rejected", { stage = "arm", error = "feature_disabled" })
+    return false
+  end
+  local raw, err = read_text_file(PENDING_PATH)
+  if not raw then
+    emit("cn_to_global_rejected", { stage = "arm", error = "pending_read_fail", detail = tostring(err) })
+    return false
+  end
+  local obj, jerr = json_decode(raw)
+  if type(obj) ~= "table" then
+    emit("cn_to_global_rejected", { stage = "arm", error = "pending_json_fail", detail = tostring(jerr) })
+    return false
+  end
+  if obj.schema_version ~= 1 then
+    emit("cn_to_global_rejected", { stage = "arm", error = "bad_schema" })
+    return false
+  end
+  if obj.source_region ~= "CN" then
+    emit("cn_to_global_rejected", { stage = "arm", error = "bad_region" })
+    return false
+  end
+  if type(obj.face_data) ~= "string" or not obj.face_data:match("^[RrDd]67") then
+    emit("cn_to_global_rejected", { stage = "arm", error = "bad_face_data" })
+    return false
+  end
+  if obj.dressing == nil then
+    emit("cn_to_global_rejected", { stage = "arm", error = "bad_dressing" })
+    return false
+  end
+  if type(obj.source_object_key) ~= "string" or #obj.source_object_key < 10 then
+    emit("cn_to_global_rejected", { stage = "arm", error = "bad_source_key" })
+    return false
+  end
+  local exp = tonumber(obj.expires_in_seconds) or 120
+  if exp < 10 then exp = 10 end
+  if exp > 600 then exp = 600 end
+  pending_conv = {
+    face_data = obj.face_data,
+    dressing = obj.dressing,
+    source_object_key = obj.source_object_key,
+    face_data_hash = obj.face_data_hash,
+    face_data_length = obj.face_data_length or #obj.face_data,
+    expires_at = os.time() + exp,
+  }
+  emit("cn_to_global_armed", {
+    source_object_key = pending_conv.source_object_key,
+    face_data_length = pending_conv.face_data_length,
+    face_data_hash = type(pending_conv.face_data_hash) == "string"
+        and pending_conv.face_data_hash:sub(1, 16) or nil,
+    expires_in_seconds = exp,
+  })
+  return true
+end
+
+-- Returns modified content string + meta, or nil if not applying.
+function try_cn_to_global_replace(content, ctx)
+  if not pending_conv then return nil end
+  if os.time() > (pending_conv.expires_at or 0) then
+    emit("cn_to_global_expired", {
+      source_object_key = pending_conv.source_object_key,
+    })
+    clear_pending("expired")
+    return nil
+  end
+
+  local text = content
+  local wrapper
+  if type(content) == "string" then
+    local s = content:match("^%s*(.*)$") or content
+    if s:sub(1, 1) ~= "{" then
+      emit("cn_to_global_rejected", { stage = "validation", error = "content_not_json" })
+      clear_pending("not_json")
+      return nil
+    end
+    local obj, err = json_decode(content)
+    if type(obj) ~= "table" then
+      emit("cn_to_global_rejected", { stage = "validation", error = "json_decode", detail = tostring(err) })
+      clear_pending("decode")
+      return nil
+    end
+    wrapper = obj
+  elseif type(content) == "table" then
+    wrapper = content
+  else
+    emit("cn_to_global_rejected", { stage = "validation", error = "bad_content_type" })
+    clear_pending("type")
+    return nil
+  end
+
+  if type(wrapper.face_data) ~= "string" or wrapper.dressing == nil then
+    emit("cn_to_global_rejected", { stage = "validation", error = "not_face_share_wrapper" })
+    -- keep armed: this upload may not be face share
+    return nil
+  end
+  local fst = wrapper.face_share_type
+  if fst ~= nil and tonumber(fst) ~= 2 then
+    emit("cn_to_global_rejected", { stage = "validation", error = "face_share_type", value = fst })
+    return nil
+  end
+
+  -- Snapshot then disarm BEFORE calling original (one-shot).
+  local snap = pending_conv
+  clear_pending("disarm_before_upload")
+
+  local preserved = {}
+  for k, _ in pairs(wrapper) do
+    preserved[#preserved + 1] = tostring(k)
+  end
+  local orig_len = type(wrapper.face_data) == "string" and #wrapper.face_data or 0
+  wrapper.face_data = snap.face_data
+  wrapper.dressing = snap.dressing
+  -- pid / hostnum / face_share_type / unknowns untouched
+
+  local encoded = json_encode_object(wrapper)
+  if type(encoded) ~= "string" or encoded:sub(1, 1) ~= "{" then
+    emit("cn_to_global_rejected", { stage = "intercept", error = "reencode_failed" })
+    return nil
+  end
+
+  emit("cn_to_global_intercepted", {
+    global_pid_present = wrapper.pid ~= nil,
+    global_hostnum = wrapper.hostnum,
+    face_share_type = wrapper.face_share_type,
+    source_face_length = orig_len,
+    replacement_face_length = snap.face_data_length,
+    source_object_key = snap.source_object_key,
+    preserved_keys = preserved,
+  })
+
+  return encoded, {
+    ok = true,
+    source_object_key = snap.source_object_key,
+    face_data_hash = snap.face_data_hash,
+    face_data_length = snap.face_data_length,
+  }
+end
+
+function finish_cn_to_global(success, pict_url, object_key, meta)
+  local host = nil
+  if type(pict_url) == "string" then
+    host = pict_url:match("https?://([^/]+)")
+  end
+  local share_code = nil
+  if type(object_key) == "string" and #object_key > 0 then
+    share_code = "wwm_facedata_R37_" .. object_key
+  end
+  local src_key = type(meta) == "table" and meta.source_object_key or nil
+  local result = {
+    schema_version = 1,
+    success = not not success,
+    source_region = "CN",
+    target_region = "GLOBAL",
+    source_object_key = src_key,
+    global_object_key = object_key,
+    share_code = share_code,
+    pict_url_host = host,
+    stage = "upload_callback",
+    error = success and nil or "upload_failed",
+  }
+  emit("cn_to_global_result", {
+    success = result.success,
+    source_region = "CN",
+    target_region = "GLOBAL",
+    source_object_key = src_key,
+    global_object_key = object_key,
+    share_code = share_code,
+    pict_url_host = host,
+  })
+  write_json_file(RESULT_PATH, result)
+end
+
+_G.__face_capture_arm_cn_global = arm_cn_to_global_from_file
+
+-- Bootstrap arm from C++ F6 flag (one inject cycle).
+if CN_TO_GLOBAL_FEATURE and _G.__FACE_CAPTURE_ARM_CN_GLOBAL == true then
+  arm_cn_to_global_from_file()
+end
+_G.__FACE_CAPTURE_ARM_CN_GLOBAL = false
 
 ------------------------------------------------------------
 -- Engine object helpers (table | instance | userdata | class)
@@ -729,7 +1065,23 @@ local function install_upload_plain_wrapper(M, object_path)
   end
 
   local wrapper = function(self, content, callback, usage, from, expiresAfter, hex_fp_review_id, ...)
-    local sum = summarize_content(content)
+    local send_content = content
+    local conv_meta = nil
+
+    -- One-shot CN→Global: only when armed and content looks like face share.
+    if type(try_cn_to_global_replace) == "function" then
+      local okc, replaced, meta = pcall(try_cn_to_global_replace, content, {
+        usage = usage,
+        from = from,
+        hex_fp_review_id = hex_fp_review_id,
+      })
+      if okc and type(replaced) == "string" and type(meta) == "table" and meta.ok then
+        send_content = replaced
+        conv_meta = meta
+      end
+    end
+
+    local sum = summarize_content(send_content)
     pcall(emit, "upload_plain_text_enter", {
       usage = usage,
       from = from,
@@ -737,11 +1089,13 @@ local function install_upload_plain_wrapper(M, object_path)
       hex_fp_review_id = hex_fp_review_id,
       callback_present = runtime_type(callback) == "function",
       content = sum,
+      cn_to_global = conv_meta and true or false,
     })
     pcall(emit, "upload_plain_text", {
       usage = usage,
       from = from,
       content = sum,
+      cn_to_global = conv_meta and true or false,
     })
 
     local cb = callback
@@ -750,7 +1104,6 @@ local function install_upload_plain_wrapper(M, object_path)
       cb = function(result, c2, detail, ...)
         local dkeys, pict, okey = {}, nil, nil
         if is_indexable(detail) then
-          -- shallow key list only for tables
           if runtime_type(detail) == "table" then
             for k, _ in pairs(detail) do dkeys[#dkeys + 1] = tostring(k) end
           end
@@ -776,11 +1129,14 @@ local function install_upload_plain_wrapper(M, object_path)
         if runtime_type(pict) == "string" and #pict > 0 then
           pcall(emit, "pict_url_found", { pict_url = pict, object_key = okey })
         end
+        if conv_meta and type(finish_cn_to_global) == "function" then
+          pcall(finish_cn_to_global, not not result, pict, okey, conv_meta)
+        end
         return orig_cb(result, c2, detail, ...)
       end
     end
 
-    return original(self, content, cb, usage, from, expiresAfter, hex_fp_review_id, ...)
+    return original(self, send_content, cb, usage, from, expiresAfter, hex_fp_review_id, ...)
   end
 
   local oks = safe_set(owner, name, wrapper)

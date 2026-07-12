@@ -123,6 +123,8 @@ HookConfig LoadConfig(const std::string &dllDir) {
       j, "enable_pcall_observer_when_loader_missing",
       c.enable_pcall_observer_when_loader_missing);
   c.enable_console = GetBool(j, "enable_console", c.enable_console);
+  c.enable_cn_to_global_conversion =
+      GetBool(j, "enable_cn_to_global_conversion", c.enable_cn_to_global_conversion);
 
   // New name preferred; accept legacy enable_winhttp_hook.
   if (HasKey(j, "enable_winhttp_fallback")) {

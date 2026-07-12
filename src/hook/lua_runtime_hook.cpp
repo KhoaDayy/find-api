@@ -46,6 +46,9 @@ std::string g_scriptPath;
 // --- Atomic / fixed-capacity state (no std::mutex / std::set on hot paths) ---
 static volatile LONG g_hookState = (LONG)LuaHookState::Disabled;
 static volatile LONG g_pendingInject = 0;
+// F6 one-shot CN→Global arm; consumed in InjectLuaScript bootstrap.
+static volatile LONG g_pendingCnToGlobalArm = 0;
+static bool g_cnToGlobalEnabled = false;
 static SRWLOCK g_stateLock = SRWLOCK_INIT;
 static constexpr int kMaxInjected = 8;
 static lua_State *g_injectedStates[kMaxInjected] = {};
@@ -187,16 +190,30 @@ void InjectLuaScript(lua_State *L) {
                         ",\"absolute\":true}");
 
   // Long-bracket path: safe, no escape issues for Windows paths.
-  // Bump '=' count if path ever contains closing delimiter (unlikely).
   std::string eq = "==";
   if (luaOut.find("]==]") != std::string::npos)
     eq = "===";
+  std::string pendingPath = g_dllDir + "captures\\pending_cn_to_global.json";
+  std::string resultPath = g_dllDir + "captures\\cn_to_global_result.json";
+  if (pendingPath.find("]==]") != std::string::npos || resultPath.find("]==]") != std::string::npos)
+    eq = "===";
+  const bool armCn =
+      g_cnToGlobalEnabled &&
+      InterlockedCompareExchange(&g_pendingCnToGlobalArm, 0, 1) == 1;
+  if (armCn)
+    BootPrintf("cn_to_global arm flag consumed; pending=%s", pendingPath.c_str());
+
   std::string preamble =
       std::string("-- face_share_logger bootstrap\n") + "_G.__FACE_CAPTURE_OUTPUT = [" + eq +
       "[" + luaOut + "]" + eq + "]\n" + "_G.__FACE_CAPTURE_FULL = " +
-      (g_cfg.capture_full_face_data ? "true" : "false") + "\n";
+      (g_cfg.capture_full_face_data ? "true" : "false") + "\n" +
+      "_G.__FACE_CAPTURE_PENDING_PATH = [" + eq + "[" + pendingPath + "]" + eq + "]\n" +
+      "_G.__FACE_CAPTURE_RESULT_PATH = [" + eq + "[" + resultPath + "]" + eq + "]\n" +
+      "_G.__FACE_CAPTURE_CN_TO_GLOBAL_ENABLED = " +
+      (g_cnToGlobalEnabled ? "true" : "false") + "\n" +
+      "_G.__FACE_CAPTURE_ARM_CN_GLOBAL = " + (armCn ? "true" : "false") + "\n";
   std::string full = preamble + script;
-  BootPrintf("lua_bootstrap_bytes=%zu", full.size());
+  BootPrintf("lua_bootstrap_bytes=%zu arm_cn=%d", full.size(), armCn ? 1 : 0);
 
   int rc = -1;
   if (g_loaderKind == LuaLoaderKind::LuaLLoadBufferX && g_lua_loadbufferx) {
@@ -496,6 +513,8 @@ bool InstallLuaRuntimeHook(const HookConfig &cfg, const std::string &dllDir) {
   g_cfg = cfg;
   g_dllDir = dllDir;
   g_scriptPath = ResolvePath(dllDir, cfg.lua_script);
+  g_cnToGlobalEnabled = cfg.enable_cn_to_global_conversion;
+  InterlockedExchange(&g_pendingCnToGlobalArm, 0);
   InterlockedExchange(&g_pendingInject, 0);
   InterlockedExchange(&g_injectedCount, 0);
   InterlockedExchange(&g_pcallObsCount, 0);
@@ -806,6 +825,38 @@ bool RequestLuaInject(char *reason, size_t reasonN) {
   }
   // Atomic arm only — no mutex, no clear of injected states.
   InterlockedExchange(&g_pendingInject, 1);
+  if (reason && reasonN)
+    _snprintf_s(reason, reasonN, _TRUNCATE, "armed");
+  return true;
+}
+
+bool RequestCnToGlobalArm(char *reason, size_t reasonN) {
+  if (!g_cnToGlobalEnabled) {
+    if (reason && reasonN)
+      _snprintf_s(reason, reasonN, _TRUNCATE, "CN_TO_GLOBAL_DISABLED");
+    return false;
+  }
+  LuaHookState st = GetHookStateLocal();
+  if (!LuaHookStateAllowsF5(st)) {
+    const char *why = LuaHookStateF5RejectReason(st);
+    if (reason && reasonN)
+      _snprintf_s(reason, reasonN, _TRUNCATE, "%s", why && why[0] ? why : "LUA_HOOK_NOT_INSTALLED");
+    return false;
+  }
+  // Pending file existence check (Lua re-validates contents).
+  std::string pendingPath = g_dllDir + "captures\\pending_cn_to_global.json";
+  DWORD attr = GetFileAttributesA(pendingPath.c_str());
+  if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+    if (reason && reasonN)
+      _snprintf_s(reason, reasonN, _TRUNCATE, "PENDING_FILE_MISSING");
+    BootPrintf("[!] F6: pending file missing: %s", pendingPath.c_str());
+    return false;
+  }
+  InterlockedExchange(&g_pendingCnToGlobalArm, 1);
+  InterlockedExchange(&g_pendingInject, 1);
+  WriteCaptureEvent("native", "cn_to_global_arm_requested",
+                    std::string("{\"pending\":") + JsonString(pendingPath) + "}");
+  BootPrintf("F6: CN→Global arm requested; inject armed");
   if (reason && reasonN)
     _snprintf_s(reason, reasonN, _TRUNCATE, "armed");
   return true;

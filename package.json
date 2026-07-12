@@ -2,8 +2,8 @@
   "name": "find-api",
   "private": true,
   "scripts": {
-    "test": "node test/parsers.test.js && node test/inventory.test.js && node test/cache.test.js && node test/hardening.test.js && node test/resolve.test.js && node test/filepicker_meta.test.js && node test/upload_capture.test.js && node test/hook_redact.test.js && node test/lua_capture_state.test.js && node test/lua_loader_analysis.test.js",
-    "test:hook": "node test/hook_redact.test.js && node test/lua_capture_state.test.js && node test/lua_loader_analysis.test.js",
+    "test": "node test/parsers.test.js && node test/inventory.test.js && node test/cache.test.js && node test/hardening.test.js && node test/resolve.test.js && node test/filepicker_meta.test.js && node test/upload_capture.test.js && node test/hook_redact.test.js && node test/lua_capture_state.test.js && node test/lua_loader_analysis.test.js && node test/cn_to_global.test.js",
+    "test:hook": "node test/hook_redact.test.js && node test/lua_capture_state.test.js && node test/lua_loader_analysis.test.js && node test/cn_to_global.test.js",
     "test:parsers": "node test/parsers.test.js",
     "test:inventory": "node test/inventory.test.js",
     "test:cache": "node test/cache.test.js",
